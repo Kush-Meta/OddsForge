@@ -67,12 +67,13 @@ impl EloCalculator {
         
         match sport {
             "football" => {
-                // For football, we need to account for draws
-                // Use a more sophisticated model that accounts for the nature of football
-                let draw_probability = 0.25; // Base draw probability
+                // Draw probability is highest when teams are evenly matched.
+                // Scales from ~32% at dead-even to ~10% for a heavy mismatch.
+                let competitiveness = 1.0 - (home_expected - 0.5).abs() * 2.0; // 1.0 = even, 0.0 = one-sided
+                let draw_probability = (0.10 + 0.22 * competitiveness).clamp(0.05, 0.35);
                 let home_win_prob = home_expected * (1.0 - draw_probability);
                 let away_win_prob = (1.0 - home_expected) * (1.0 - draw_probability);
-                
+
                 (home_win_prob, away_win_prob, Some(draw_probability))
             }
             "basketball" => {

@@ -107,20 +107,27 @@ const Dashboard: React.FC = () => {
   const [error, setError]         = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState('all');
 
-  const fetchMatches = async (sport?: string) => {
-    setLoading(true);
+  const fetchMatches = async (sport?: string, silent = false) => {
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const data = await apiService.getUpcomingMatches(sport === 'all' ? undefined : sport, 30);
       setMatches(data);
     } catch {
-      setError('Failed to fetch matches. Make sure the backend is running on port 3000.');
+      if (!silent) setError('Failed to fetch matches. Make sure the backend is running on port 3000.');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
+  // Initial fetch + re-fetch when tab changes
   useEffect(() => { fetchMatches(activeTab); }, [activeTab]);
+
+  // Auto-refresh every 60 s (matches the backend scheduler interval)
+  useEffect(() => {
+    const interval = setInterval(() => fetchMatches(activeTab, true), 60_000);
+    return () => clearInterval(interval);
+  }, [activeTab]);
 
   const withPredictions = matches.filter(m => m.prediction);
   const highConfidence  = matches.filter(m => m.prediction && m.prediction.confidence_score > 0.7);

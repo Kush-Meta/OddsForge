@@ -1,21 +1,57 @@
 pub mod seed;
 pub use seed::seed_data;
 
+pub async fn clear_all_data(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("DELETE FROM predictions").execute(pool).await?;
+    sqlx::query("DELETE FROM matches").execute(pool).await?;
+    sqlx::query("DELETE FROM season_stats").execute(pool).await?;
+    sqlx::query("DELETE FROM elo_history").execute(pool).await?;
+    sqlx::query("DELETE FROM teams").execute(pool).await?;
+    tracing::info!("All data cleared");
+    Ok(())
+}
+
 use anyhow::Result;
 use chrono::Utc;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use std::env;
+use std::str::FromStr;
 
 use crate::models::*;
 
 pub async fn create_pool() -> Result<SqlitePool> {
-    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:../data/oddsforge.db".to_string());
-    let pool = SqlitePool::connect(&database_url).await?;
+    let database_url = env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite:../data/oddsforge.db".to_string());
+
+    // Strip the "sqlite:" prefix to get the file path, create parent dir if needed
+    let file_path = database_url
+        .strip_prefix("sqlite:///")
+        .or_else(|| database_url.strip_prefix("sqlite://"))
+        .or_else(|| database_url.strip_prefix("sqlite:"))
+        .unwrap_or(&database_url);
+
+    if let Some(parent) = std::path::Path::new(file_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+    }
+
+    let options = SqliteConnectOptions::from_str(&database_url)?
+        .create_if_missing(true);
+
+    let pool = SqlitePool::connect_with(options).await?;
     Ok(pool)
 }
 
+/// Called from the CLI where no pool exists yet.
 pub async fn init_database() -> Result<()> {
     let pool = create_pool().await?;
+    init_database_with_pool(&pool).await
+}
+
+/// Called from the server so schema creation shares the main pool.
+pub async fn init_database_with_pool(pool: &SqlitePool) -> Result<()> {
+    let pool = pool.clone(); // clone is cheap (Arc refcount) — gives us SqlitePool, not &SqlitePool
     
     // Create tables
     sqlx::query(
@@ -267,6 +303,34 @@ pub async fn get_upcoming_matches(pool: &SqlitePool, sport: Option<&str>) -> Res
     Ok(matches)
 }
 
+pub async fn get_finished_matches_ordered(pool: &SqlitePool) -> Result<Vec<Match>> {
+    let rows = sqlx::query(
+        "SELECT * FROM matches WHERE status = 'finished' AND home_score IS NOT NULL ORDER BY match_date ASC"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut matches = Vec::new();
+    for row in rows {
+        matches.push(Match {
+            id:             row.get("id"),
+            home_team_id:   row.get("home_team_id"),
+            away_team_id:   row.get("away_team_id"),
+            home_team_name: row.get("home_team_name"),
+            away_team_name: row.get("away_team_name"),
+            sport:          row.get("sport"),
+            league:         row.get("league"),
+            match_date:     chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("match_date"))?.with_timezone(&Utc),
+            status:         row.get("status"),
+            home_score:     row.get("home_score"),
+            away_score:     row.get("away_score"),
+            created_at:     chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))?.with_timezone(&Utc),
+            updated_at:     chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))?.with_timezone(&Utc),
+        });
+    }
+    Ok(matches)
+}
+
 // Prediction operations
 pub async fn insert_prediction(pool: &SqlitePool, prediction: &Prediction) -> Result<()> {
     sqlx::query(
@@ -396,6 +460,27 @@ pub async fn get_team_recent_matches(pool: &SqlitePool, team_id: &str, limit: i6
         });
     }
     Ok(matches)
+}
+
+pub async fn insert_elo_history(
+    pool: &SqlitePool,
+    team_id: &str,
+    date: chrono::DateTime<Utc>,
+    elo_rating: f64,
+    match_id: &str,
+) -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT OR IGNORE INTO elo_history (id, team_id, date, elo_rating, match_id) VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind(id)
+    .bind(team_id)
+    .bind(date.to_rfc3339())
+    .bind(elo_rating)
+    .bind(match_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn get_elo_history(pool: &SqlitePool, team_id: &str) -> Result<Vec<EloHistoryPoint>> {

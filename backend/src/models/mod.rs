@@ -62,7 +62,6 @@ pub struct TeamStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpcomingMatchWithPrediction {
-    #[serde(flatten)]
     pub match_info: Match,
     pub prediction: Option<Prediction>,
     pub home_team_stats: Option<TeamStats>,

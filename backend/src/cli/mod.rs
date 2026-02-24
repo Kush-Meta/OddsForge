@@ -14,10 +14,7 @@ pub async fn fetch_data(sport: &str) -> Result<()> {
         "football" | "soccer" => {
             println!("📥 Fetching EPL teams...");
             fetcher.fetch_epl_teams(&pool).await?;
-            
-            println!("📥 Fetching Champions League teams...");
-            fetcher.fetch_champions_league_teams(&pool).await?;
-            
+
             println!("📥 Fetching EPL matches...");
             fetcher.fetch_epl_matches(&pool).await?;
             

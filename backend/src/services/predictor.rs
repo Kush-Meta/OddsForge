@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 // use nalgebra::{DVector, DMatrix}; // For future advanced statistical models
@@ -8,6 +8,14 @@ use uuid::Uuid;
 use crate::db::{get_team_by_id, insert_prediction, get_prediction_by_match_id};
 use crate::models::{Match, Prediction, Team};
 use crate::services::EloCalculator;
+
+/// Captures recent weighted performance for a team in a specific playing context (home or away).
+struct RollingForm {
+    /// Exponentially-weighted points rate, normalised to [0, 1].
+    /// 1.0 = winning every game, 0.0 = losing every game.
+    rate: f64,
+    sample_size: usize,
+}
 
 pub struct PredictionEngine {
     elo_calculator: EloCalculator,
@@ -94,13 +102,26 @@ impl PredictionEngine {
             (form_home_prob, form_away_prob, form_draw_prob),
         );
 
+        // Apply rest-day adjustment for NBA — back-to-backs are a major predictive signal.
+        // Research: each net rest day is worth ~2.5 pp in win probability (capped at ±3 days).
+        // Football is excluded: rest effects are smaller and partly captured by form already.
+        let (final_home, final_away) = if match_data.sport == "basketball" {
+            let rest_adj = self.rest_day_advantage(pool, match_data).await.unwrap_or(0.0);
+            let adj_home = (normalized_home + rest_adj).max(0.01);
+            let adj_away = (normalized_away - rest_adj).max(0.01);
+            let sum = adj_home + adj_away;
+            (adj_home / sum, adj_away / sum)
+        } else {
+            (normalized_home, normalized_away)
+        };
+
         Ok(Prediction {
             id: Uuid::new_v4().to_string(),
             match_id: match_data.id.clone(),
-            home_win_probability: normalized_home,
-            away_win_probability: normalized_away,
+            home_win_probability: final_home,
+            away_win_probability: final_away,
             draw_probability: normalized_draw,
-            model_version: "ensemble_v1.0".to_string(),
+            model_version: "ensemble_v2.0".to_string(),
             confidence_score: confidence,
             created_at: Utc::now(),
         })
@@ -161,8 +182,9 @@ impl PredictionEngine {
             None
         };
 
-        // Apply some regression to the mean to avoid overconfidence
-        let regression_factor = 0.3;
+        // Regression to mean: scales down with sample size.
+        // With 1 H2H match we regress 90%, with 10+ we regress ~30%.
+        let regression_factor = (1.0 - (total_matches as f64).sqrt() / 4.0).clamp(0.30, 0.90);
         let (default_home, default_away, default_draw) = self.league_average_prediction(sport)?;
         
         let adjusted_home = home_prob * (1.0 - regression_factor) + default_home * regression_factor;
@@ -175,33 +197,114 @@ impl PredictionEngine {
         Ok((adjusted_home, adjusted_away, adjusted_draw))
     }
 
-    /// Form-based prediction using recent team performance
+    /// Form-based prediction using each team's real recent results from the database.
+    ///
+    /// Uses home team's last 8 HOME games and away team's last 8 AWAY games — the contextual
+    /// split (home form vs away form) is more predictive than overall form.
+    /// Results are exponentially decayed so the most recent game weighs most heavily.
     async fn form_based_prediction(&self,
-        _pool: &SqlitePool,
+        pool: &SqlitePool,
         home_team: &Team,
         away_team: &Team,
         sport: &str,
     ) -> Result<(f64, f64, Option<f64>)> {
-        // Simplified form-based prediction using ELO ratings as proxy for form
-        // In a more sophisticated version, this would analyze recent match results, goals scored/conceded, etc.
-        
-        let elo_diff = home_team.elo_rating - away_team.elo_rating;
-        
-        // Convert ELO difference to win probability using sigmoid function
-        let sigmoid = |x: f64| 1.0 / (1.0 + (-x / 200.0).exp());
-        let home_prob_base = sigmoid(elo_diff + 50.0); // Home advantage
-        
+        let home_form = self.rolling_form(pool, &home_team.id, true, sport).await?;
+        let away_form = self.rolling_form(pool, &away_team.id, false, sport).await?;
+
+        // Not enough real data yet — fall back to league average
+        if home_form.sample_size < 3 || away_form.sample_size < 3 {
+            return self.league_average_prediction(sport);
+        }
+
+        // form_diff ∈ [-1, 1]: positive = home team in better contextual form
+        let form_diff = home_form.rate - away_form.rate;
+        // 0.30 home-field bonus keeps this consistent with the ELO model's +100-pt boost
+        let adjusted = form_diff + 0.30;
+        let home_prob_base = 1.0 / (1.0 + (-adjusted * 3.0).exp());
+
         match sport {
             "football" => {
-                let draw_prob = 0.27; // Average draw rate in football
-                let home_prob = home_prob_base * (1.0 - draw_prob);
-                let away_prob = (1.0 - home_prob_base) * (1.0 - draw_prob);
-                Ok((home_prob, away_prob, Some(draw_prob)))
+                let competitiveness = 1.0 - (home_prob_base - 0.5).abs() * 2.0;
+                let draw_prob = (0.10 + 0.22 * competitiveness).clamp(0.05, 0.35);
+                Ok((
+                    home_prob_base * (1.0 - draw_prob),
+                    (1.0 - home_prob_base) * (1.0 - draw_prob),
+                    Some(draw_prob),
+                ))
             }
-            _ => {
-                Ok((home_prob_base, 1.0 - home_prob_base, None))
-            }
+            _ => Ok((home_prob_base, 1.0 - home_prob_base, None)),
         }
+    }
+
+    /// Compute exponentially-weighted recent form for a team in a specific playing context.
+    ///
+    /// `home_context = true`  → query only games the team played at home
+    /// `home_context = false` → query only games the team played away
+    async fn rolling_form(
+        &self,
+        pool: &SqlitePool,
+        team_id: &str,
+        home_context: bool,
+        sport: &str,
+    ) -> Result<RollingForm> {
+        let matches: Vec<Match> = if home_context {
+            sqlx::query_as::<_, Match>(
+                "SELECT * FROM matches
+                 WHERE home_team_id = ? AND status = 'finished'
+                   AND home_score IS NOT NULL AND sport = ?
+                 ORDER BY match_date DESC LIMIT 8",
+            )
+            .bind(team_id)
+            .bind(sport)
+            .fetch_all(pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, Match>(
+                "SELECT * FROM matches
+                 WHERE away_team_id = ? AND status = 'finished'
+                   AND away_score IS NOT NULL AND sport = ?
+                 ORDER BY match_date DESC LIMIT 8",
+            )
+            .bind(team_id)
+            .bind(sport)
+            .fetch_all(pool)
+            .await?
+        };
+
+        if matches.is_empty() {
+            return Ok(RollingForm { rate: 0.5, sample_size: 0 });
+        }
+
+        // Max points per game: 3 (football W) or 1 (basketball W)
+        let max_pts = if sport == "football" { 3.0_f64 } else { 1.0_f64 };
+        let mut weighted_pts = 0.0_f64;
+        let mut weight_total = 0.0_f64;
+
+        for (i, m) in matches.iter().enumerate() {
+            // Rows are newest-first (ORDER BY DESC), so i=0 is the most recent match.
+            let decay = 0.85_f64.powi(i as i32);
+
+            let pts = match (m.home_score, m.away_score) {
+                (Some(hs), Some(as_)) => {
+                    if home_context {
+                        if hs > as_ { max_pts }
+                        else if hs == as_ && sport == "football" { 1.0 }
+                        else { 0.0 }
+                    } else {
+                        if as_ > hs { max_pts }
+                        else if as_ == hs && sport == "football" { 1.0 }
+                        else { 0.0 }
+                    }
+                }
+                _ => max_pts * 0.5, // unknown score → assume average
+            };
+
+            weighted_pts += decay * pts;
+            weight_total += decay * max_pts;
+        }
+
+        let rate = if weight_total > 0.0 { weighted_pts / weight_total } else { 0.5 };
+        Ok(RollingForm { rate, sample_size: matches.len() })
     }
 
     /// Get league average probabilities
@@ -322,6 +425,45 @@ impl PredictionEngine {
     fn calculate_edge_value(&self, our_probability: f64, market_odds: f64) -> f64 {
         let implied_market_probability = 1.0 / market_odds;
         (our_probability - implied_market_probability).max(0.0)
+    }
+
+    /// NBA rest-day advantage: returns a probability delta for the home team.
+    ///
+    /// Positive = home team is better rested; negative = away team is better rested.
+    /// Literature: each net rest day is worth ~2.5 pp in NBA win probability (capped at ±3 days).
+    async fn rest_day_advantage(&self, pool: &SqlitePool, match_data: &Match) -> Result<f64> {
+        let home_rest = self.days_rest(pool, &match_data.home_team_id, match_data.match_date).await?;
+        let away_rest = self.days_rest(pool, &match_data.away_team_id, match_data.match_date).await?;
+        // unwrap_or(3): if no prior game found, assume well-rested
+        let net = (home_rest.unwrap_or(3) as i64 - away_rest.unwrap_or(3) as i64).clamp(-3, 3);
+        Ok(net as f64 * 0.025)
+    }
+
+    /// Returns the number of rest days a team has before `upcoming_date`.
+    /// Defined as (days since their last finished game) − 1, capped at 7.
+    async fn days_rest(
+        &self,
+        pool: &SqlitePool,
+        team_id: &str,
+        upcoming_date: DateTime<Utc>,
+    ) -> Result<Option<u32>> {
+        let last = sqlx::query_as::<_, Match>(
+            "SELECT * FROM matches
+             WHERE (home_team_id = ? OR away_team_id = ?)
+               AND status = 'finished'
+               AND match_date < ?
+             ORDER BY match_date DESC LIMIT 1",
+        )
+        .bind(team_id)
+        .bind(team_id)
+        .bind(upcoming_date)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(last.map(|m| {
+            let days = (upcoming_date - m.match_date).num_days().max(0) as u32;
+            days.saturating_sub(1).min(7)
+        }))
     }
 
     /// Advanced statistical model using logistic regression

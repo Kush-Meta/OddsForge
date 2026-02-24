@@ -1,0 +1,36 @@
+# Fly.io configuration for OddsForge backend
+# Deploy with: fly deploy  (from the backend/ directory)
+app = "oddsforge-backend"
+primary_region = "lhr"
+
+[build]
+
+[env]
+  DATABASE_URL = "sqlite:///data/oddsforge.db"
+  RUST_LOG     = "info"
+
+# Secrets (set via `fly secrets set`, never committed to git):
+#   BALLDONTLIE_API_KEY=...
+#   FOOTBALL_DATA_API_KEY=...
+
+[http_service]
+  internal_port        = 3000
+  force_https          = true
+  auto_stop_machines   = true   # machine sleeps when idle (saves cost)
+  auto_start_machines  = true   # wakes on first request
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type       = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+# Persistent volume — stores the SQLite database across deploys and restarts.
+# Create once with: fly volumes create oddsforge_data --size 1
+[[mounts]]
+  source      = "oddsforge_data"
+  destination = "/data"
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "512mb"

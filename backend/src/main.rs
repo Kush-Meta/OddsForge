@@ -41,11 +41,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-    
-    // Load environment variables
+    // Load .env before tracing so RUST_LOG is available
     dotenv::dotenv().ok();
+
+    // Initialize tracing (reads RUST_LOG from env)
+    tracing_subscriber::fmt::init();
     
     let cli = Cli::parse();
 
