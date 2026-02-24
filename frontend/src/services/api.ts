@@ -78,6 +78,12 @@ export const apiService = {
     return response.data.data || 'OK';
   },
 
+  // All teams
+  async getAllTeams(): Promise<Team[]> {
+    const response = await api.get<ApiResponse<Team[]>>('/teams');
+    return response.data.data || [];
+  },
+
   // Matches
   async getUpcomingMatches(sport?: string, limit?: number): Promise<UpcomingMatchWithPrediction[]> {
     const params = new URLSearchParams();

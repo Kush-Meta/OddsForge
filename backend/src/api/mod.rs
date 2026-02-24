@@ -11,13 +11,21 @@ use std::collections::HashMap;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
-use crate::db::{create_pool, get_team_by_id, get_teams_by_league, get_upcoming_matches, get_prediction_by_match_id};
+use crate::db::{
+    create_pool, get_all_teams, get_elo_history, get_team_by_id, get_team_current_stats,
+    get_team_recent_matches, get_teams_by_league, get_upcoming_matches,
+    get_prediction_by_match_id, init_database, seed_data,
+};
 use crate::models::{ApiResponse, DatasetRequest, UpcomingMatchWithPrediction, TeamProfile, Team};
 use crate::services::{DataFetcher, PredictionEngine};
 
 pub async fn serve(port: u16) -> anyhow::Result<()> {
     let pool = create_pool().await?;
-    
+
+    // Ensure schema and seed data exist
+    init_database().await?;
+    seed_data(&pool).await?;
+
     let app = create_router().with_state(pool);
     
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
@@ -31,8 +39,9 @@ fn create_router() -> Router<SqlitePool> {
     Router::new()
         .route("/health", get(health_check))
         .route("/matches/upcoming", get(get_upcoming_matches_handler))
-        .route("/teams/:id/stats", get(get_team_stats_handler))
+        .route("/teams", get(get_all_teams_handler))
         .route("/teams/league/:sport/:league", get(get_teams_by_league_handler))
+        .route("/teams/:id/stats", get(get_team_stats_handler))
         .route("/predictions/edges", get(get_prediction_edges_handler))
         .route("/datasets/generate", post(generate_dataset_handler))
         .route("/data/fetch", post(fetch_data_handler))
@@ -85,6 +94,19 @@ async fn get_upcoming_matches_handler(
     }
 }
 
+// GET /teams - List all teams
+async fn get_all_teams_handler(
+    State(pool): State<SqlitePool>,
+) -> Result<Json<ApiResponse<Vec<Team>>>, StatusCode> {
+    match get_all_teams(&pool).await {
+        Ok(teams) => Ok(Json(ApiResponse::success(teams))),
+        Err(e) => {
+            tracing::error!("Failed to fetch teams: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 // GET /teams/:id/stats - Get team analytics
 async fn get_team_stats_handler(
     State(pool): State<SqlitePool>,
@@ -92,13 +114,14 @@ async fn get_team_stats_handler(
 ) -> Result<Json<ApiResponse<TeamProfile>>, StatusCode> {
     match get_team_by_id(&pool, &team_id).await {
         Ok(Some(team)) => {
-            // TODO: Implement full team profile with stats, recent matches, ELO history
-            let profile = TeamProfile {
-                team,
-                current_stats: crate::models::TeamStats {
+            let current_stats = get_team_current_stats(&pool, &team_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| crate::models::TeamStats {
                     id: uuid::Uuid::new_v4().to_string(),
                     team_id: team_id.clone(),
-                    season: "2024-25".to_string(),
+                    season: "2025-26".to_string(),
                     matches_played: 0,
                     wins: 0,
                     draws: Some(0),
@@ -107,13 +130,25 @@ async fn get_team_stats_handler(
                     goals_against: Some(0),
                     points_for: Some(0),
                     points_against: Some(0),
-                    form: "".to_string(),
+                    form: String::new(),
                     updated_at: chrono::Utc::now(),
-                },
-                recent_matches: vec![],
-                elo_history: vec![],
+                });
+
+            let recent_matches = get_team_recent_matches(&pool, &team_id, 8)
+                .await
+                .unwrap_or_default();
+
+            let elo_history = get_elo_history(&pool, &team_id)
+                .await
+                .unwrap_or_default();
+
+            let profile = TeamProfile {
+                team,
+                current_stats,
+                recent_matches,
+                elo_history,
             };
-            
+
             Ok(Json(ApiResponse::success(profile)))
         }
         Ok(None) => Err(StatusCode::NOT_FOUND),

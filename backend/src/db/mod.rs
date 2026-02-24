@@ -1,3 +1,6 @@
+pub mod seed;
+pub use seed::seed_data;
+
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};
@@ -308,4 +311,109 @@ pub async fn get_prediction_by_match_id(pool: &SqlitePool, match_id: &str) -> Re
     } else {
         Ok(None)
     }
+}
+
+// Additional query helpers
+
+pub async fn get_all_teams(pool: &SqlitePool) -> Result<Vec<Team>> {
+    let rows = sqlx::query("SELECT * FROM teams ORDER BY sport, league, elo_rating DESC")
+        .fetch_all(pool)
+        .await?;
+
+    let mut teams = Vec::new();
+    for row in rows {
+        teams.push(Team {
+            id: row.get("id"),
+            name: row.get("name"),
+            sport: row.get("sport"),
+            league: row.get("league"),
+            logo_url: row.get("logo_url"),
+            elo_rating: row.get("elo_rating"),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))?.with_timezone(&Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))?.with_timezone(&Utc),
+        });
+    }
+    Ok(teams)
+}
+
+pub async fn get_team_current_stats(pool: &SqlitePool, team_id: &str) -> Result<Option<TeamStats>> {
+    let row = sqlx::query(
+        "SELECT * FROM team_stats WHERE team_id = ? ORDER BY season DESC LIMIT 1"
+    )
+    .bind(team_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = row {
+        Ok(Some(TeamStats {
+            id: row.get("id"),
+            team_id: row.get("team_id"),
+            season: row.get("season"),
+            matches_played: row.get("matches_played"),
+            wins: row.get("wins"),
+            draws: row.get("draws"),
+            losses: row.get("losses"),
+            goals_for: row.get("goals_for"),
+            goals_against: row.get("goals_against"),
+            points_for: row.get("points_for"),
+            points_against: row.get("points_against"),
+            form: row.get::<Option<String>, _>("form").unwrap_or_default(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))?.with_timezone(&Utc),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+pub async fn get_team_recent_matches(pool: &SqlitePool, team_id: &str, limit: i64) -> Result<Vec<Match>> {
+    let rows = sqlx::query(
+        r#"SELECT * FROM matches
+           WHERE (home_team_id = ? OR away_team_id = ?) AND status = 'finished'
+           ORDER BY match_date DESC LIMIT ?"#
+    )
+    .bind(team_id)
+    .bind(team_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut matches = Vec::new();
+    for row in rows {
+        matches.push(Match {
+            id: row.get("id"),
+            home_team_id: row.get("home_team_id"),
+            away_team_id: row.get("away_team_id"),
+            home_team_name: row.get("home_team_name"),
+            away_team_name: row.get("away_team_name"),
+            sport: row.get("sport"),
+            league: row.get("league"),
+            match_date: chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("match_date"))?.with_timezone(&Utc),
+            status: row.get("status"),
+            home_score: row.get("home_score"),
+            away_score: row.get("away_score"),
+            created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("created_at"))?.with_timezone(&Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("updated_at"))?.with_timezone(&Utc),
+        });
+    }
+    Ok(matches)
+}
+
+pub async fn get_elo_history(pool: &SqlitePool, team_id: &str) -> Result<Vec<EloHistoryPoint>> {
+    let rows = sqlx::query(
+        "SELECT * FROM elo_history WHERE team_id = ? ORDER BY date ASC"
+    )
+    .bind(team_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut history = Vec::new();
+    for row in rows {
+        history.push(EloHistoryPoint {
+            team_id: row.get("team_id"),
+            date: chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("date"))?.with_timezone(&Utc),
+            elo_rating: row.get("elo_rating"),
+            match_id: row.get("match_id"),
+        });
+    }
+    Ok(history)
 }

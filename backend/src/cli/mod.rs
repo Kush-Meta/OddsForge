@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sqlx::{SqlitePool, Row};
+use sqlx::Row;
 
 use crate::db::{create_pool, get_upcoming_matches};
 use crate::services::{DataFetcher, PredictionEngine};

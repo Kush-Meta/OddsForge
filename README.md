@@ -1,317 +1,208 @@
 # OddsForge 🎯
 
-A Rust-powered sports analytics platform for prediction markets. Features ELO ratings, machine learning predictions, and market edge detection for EPL, Champions League, and NBA.
+A full-stack sports analytics platform built with **Rust** (backend) and **React + TypeScript** (frontend). It uses an **ELO rating engine** and an **ensemble prediction model** to forecast match outcomes for the EPL and NBA, then surfaces *market edges* where the model disagrees with betting-market implied probabilities.
 
-![OddsForge Architecture](docs/architecture.png)
+No external API keys required — the app seeds itself with realistic data on first launch.
 
-## 🏗️ Architecture
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Backend | Rust · Axum · SQLx · SQLite |
+| Predictions | ELO system · Ensemble model (ELO + H2H + form) |
+| Frontend | React 19 · TypeScript · react-router-dom |
+| Charts | Recharts |
+| Icons | Lucide React |
+
+---
+
+## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   React Frontend │────▶│   Rust Backend  │────▶│   SQLite DB     │
-│   (Dashboard)    │     │   (API + ML)    │     │   (Sports Data) │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                                │
-                                ▼
-                        ┌─────────────────┐
-                        │   External APIs │
-                        │ • football-data │
-                        │ • balldontlie   │
-                        └─────────────────┘
+┌─────────────────────┐        ┌──────────────────────┐        ┌──────────────┐
+│  React Frontend     │──HTTP──▶  Rust API (Axum)      │──SQLx──▶  SQLite DB   │
+│  localhost:3001     │        │  localhost:3000        │        │  data/       │
+└─────────────────────┘        └──────────────────────┘        └──────────────┘
 ```
 
-### Components
+---
 
-- **Backend (Rust)**: High-performance API server with prediction engine
-- **Frontend (React + TypeScript)**: Modern dashboard with dark theme
-- **Database (SQLite)**: Efficient local storage for teams, matches, and predictions
-- **Data Sources**: Free sports APIs (football-data.org, balldontlie.io)
+## Features
 
-## ✨ Features
+### Dashboard
+- Live-updating cards for upcoming EPL & NBA matches
+- Animated win-probability bars (home / draw / away)
+- League filter tabs and confidence meters
+- Stats summary: total matches, predictions count, high-confidence picks
 
-### 🏈 Sports Analytics
-- **ELO Rating System**: Dynamic team strength calculations
-- **Machine Learning**: Ensemble predictions combining multiple models
-- **Head-to-Head Analysis**: Historical matchup insights
-- **Form Tracking**: Recent performance impact on predictions
+### Edge Finder
+- Sortable table of matches where our model's probability differs from market implied odds by **>5%**
+- Columns: Match · League · Our Prediction · Market Implied · Market Odds · Edge % · Confidence
+- Colour-coded edge badges (green / amber / grey by magnitude)
 
-### 📊 Market Intelligence
-- **Edge Detection**: Compare model predictions vs market odds
-- **Confidence Scoring**: Model agreement analysis
-- **Dataset Builder**: Custom CSV/JSON export for research
+### Dataset Builder
+- Form-driven interface: sport, date range, data categories (basic / teams / predictions)
+- Exports CSV or JSON from the database via a REST call
+- Preview panel shows which columns will be included
 
-### 🎮 Multi-Sport Support
-- ⚽ **Football**: EPL, Champions League (with draws)
-- 🏀 **Basketball**: NBA (binary outcomes)
+### Team Profiles
+- Searchable sidebar listing all 50 teams (20 EPL + 30 NBA)
+- ELO rating history line chart (Recharts)
+- Season stats: W / D / L, goals, points-per-game, win rate
+- Recent results table with W / D / L badges
 
-## 🚀 Quick Start
+---
 
-### Prerequisites
-
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install Node.js (for frontend)
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-nvm install 18
-```
-
-### Setup
-
-1. **Clone and setup**:
-```bash
-git clone https://github.com/Kush-Meta/OddsForge.git
-cd OddsForge
-```
-
-2. **Backend setup**:
-```bash
-cd backend
-cp .env.example .env
-# Optional: Add your football-data.org API key to .env
-```
-
-3. **Initialize database**:
-```bash
-cargo run -- init-db
-```
-
-4. **Fetch sports data** (free APIs):
-```bash
-cargo run -- fetch --sport all
-```
-
-5. **Generate predictions**:
-```bash
-cargo run -- predict
-```
-
-6. **Start API server**:
-```bash
-cargo run -- serve --port 3000
-```
-
-7. **Frontend setup** (in another terminal):
-```bash
-cd ../frontend
-npm install
-npm start
-```
-
-Visit [http://localhost:3001](http://localhost:3001) 🎉
-
-## 🎯 CLI Usage
-
-```bash
-# Initialize database
-cargo run -- init-db
-
-# Fetch data for specific sport
-cargo run -- fetch --sport football
-cargo run -- fetch --sport basketball
-
-# Generate predictions
-cargo run -- predict
-
-# Query team information
-cargo run -- team --name "Arsenal"
-
-# Start API server
-cargo run -- serve --port 3000
-```
-
-## 🔌 API Endpoints
-
-### Core Endpoints
-
-```http
-GET /health                    # Health check
-GET /matches/upcoming          # Upcoming matches with predictions
-GET /teams/{id}/stats         # Team analytics and profile
-GET /predictions/edges        # Market edge opportunities
-POST /datasets/generate       # Custom dataset builder
-POST /data/fetch             # Fetch latest sports data
-POST /predictions/generate   # Generate predictions
-```
-
-### Example Requests
-
-```bash
-# Get upcoming matches
-curl http://localhost:3000/matches/upcoming?sport=football&limit=10
-
-# Get team stats
-curl http://localhost:3000/teams/epl_57/stats
-
-# Find market edges
-curl http://localhost:3000/predictions/edges
-
-# Generate custom dataset
-curl -X POST http://localhost:3000/datasets/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sport": "football",
-    "stats_categories": ["basic", "teams", "predictions"],
-    "format": "csv"
-  }'
-```
-
-## 🧠 Prediction Models
-
-### ELO Rating System
-- Dynamic team strength based on match results
-- Home advantage factoring (+100 ELO points)
-- Goal difference multipliers for accurate updates
-
-### Ensemble Model
-Combines multiple prediction approaches:
-
-1. **ELO-based** (50% weight): Pure rating differential
-2. **Head-to-head** (30% weight): Historical matchup analysis  
-3. **Form-based** (20% weight): Recent performance trends
-
-### Confidence Scoring
-- Model agreement analysis
-- Standard deviation across predictions
-- Ranges from 50% (low confidence) to 100% (high confidence)
-
-## 📁 Project Structure
+## Project Structure
 
 ```
 OddsForge/
-├── backend/                 # Rust API server
+├── backend/                     # Rust API server
 │   ├── src/
-│   │   ├── api/            # REST API endpoints
-│   │   ├── db/             # Database operations
-│   │   ├── models/         # Data structures
-│   │   ├── services/       # Business logic
-│   │   │   ├── data_fetcher.rs    # Sports API integration
-│   │   │   ├── elo_calculator.rs  # Rating system
-│   │   │   └── predictor.rs       # ML models
-│   │   ├── cli/            # Command line interface
-│   │   └── utils/          # Helper functions
+│   │   ├── api/mod.rs           # REST endpoints + CORS
+│   │   ├── db/
+│   │   │   ├── mod.rs           # Query helpers
+│   │   │   └── seed.rs          # Seed data (20 EPL + 30 NBA teams, 50 matches)
+│   │   ├── models/mod.rs        # Shared data types
+│   │   ├── services/
+│   │   │   ├── elo_calculator.rs
+│   │   │   ├── predictor.rs     # Ensemble model
+│   │   │   └── data_fetcher.rs  # Optional external API client
+│   │   ├── cli/mod.rs           # CLI subcommands
+│   │   └── main.rs
 │   └── Cargo.toml
-├── frontend/               # React dashboard
+├── frontend/                    # React app
 │   ├── src/
-│   │   ├── components/     # UI components
-│   │   ├── pages/          # Main pages
-│   │   └── services/       # API client
+│   │   ├── pages/
+│   │   │   ├── Dashboard.tsx
+│   │   │   ├── EdgeFinder.tsx
+│   │   │   ├── DatasetBuilder.tsx
+│   │   │   └── TeamProfile.tsx
+│   │   ├── services/api.ts      # Axios API client
+│   │   ├── App.tsx
+│   │   └── index.css            # Dark theme (CSS variables)
 │   └── package.json
-├── data/                   # SQLite database & exports
-│   ├── oddsforge.db
+├── data/                        # Auto-created at runtime
 │   └── exports/
 └── README.md
 ```
 
-## 🌐 Data Sources
+---
 
-### Football Data (Optional - Requires API Key)
-- **Source**: [football-data.org](https://www.football-data.org/)
-- **Coverage**: EPL, Champions League
-- **Rate Limit**: 10 requests/minute (free tier)
-- **Features**: Team info, fixtures, results
+## Quick Start
 
-### NBA Data (Free)
-- **Source**: [balldontlie.io](https://www.balldontlie.io/)
-- **Coverage**: NBA teams and games
-- **Rate Limit**: None
-- **Features**: Team stats, game results
-
-## 🎨 Frontend Features
-
-### Dashboard
-- Upcoming matches with win probabilities
-- League standings with ELO ratings
-- Recent predictions accuracy
-
-### Edge Finder
-- Model vs market odds comparison
-- Profitable betting opportunities
-- Confidence-weighted recommendations
-
-### Dataset Builder
-- Custom data exports
-- Multiple format support (CSV, JSON)
-- Flexible filtering options
-
-### Team Profiles
-- Historical ELO rating charts
-- Recent match results and form
-- Head-to-head records
-
-## ⚙️ Configuration
-
-### Environment Variables
+### Prerequisites
 
 ```bash
-# Database
-DATABASE_URL=sqlite:../data/oddsforge.db
+# Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# APIs (optional)
-FOOTBALL_DATA_API_KEY=your_key_here
-
-# Server
-PORT=3000
-RUST_LOG=info
-
-# Model Parameters
-ELO_K_FACTOR=32
-HOME_ADVANTAGE=100
+# Node.js ≥ 18
+brew install node@22          # macOS
 ```
 
-## 🧪 Development
+### 1 — Start the backend
 
-### Run Tests
 ```bash
-cargo test
+cd backend
+cargo run                    # defaults to: serve --port 3000
+# The database is created and seeded automatically on first run.
 ```
 
-### Code Formatting
+### 2 — Start the frontend (new terminal)
+
 ```bash
-cargo fmt
+cd frontend
+npm install
+npm start                    # http://localhost:3001
 ```
 
-### Linting
-```bash
-cargo clippy
-```
-
-### Watch Mode
-```bash
-cargo watch -x run
-```
-
-## 📈 Roadmap
-
-- [ ] **Advanced Models**: Neural networks, XGBoost
-- [ ] **More Sports**: NFL, Premier League, La Liga
-- [ ] **Live Data**: WebSocket real-time updates
-- [ ] **Betting Integration**: Odds API integration
-- [ ] **Mobile App**: React Native companion
-- [ ] **Cloud Deploy**: Docker + AWS/Railway
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📜 License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
-## 🙏 Acknowledgments
-
-- [football-data.org](https://www.football-data.org/) for football data API
-- [balldontlie.io](https://www.balldontlie.io/) for free NBA data
-- Rust community for excellent crates
-- Sports analytics community for inspiration
+That's it. No API keys, no external databases, no environment variables required.
 
 ---
 
-**Made with ❤️ and ⚡ Rust**
+## API Endpoints
 
-*Predict smarter, bet better* 🎯
+```
+GET  /health                        Health check
+GET  /matches/upcoming?sport=&limit= Upcoming matches with predictions
+GET  /teams                         All teams
+GET  /teams/league/:sport/:league    Teams filtered by league
+GET  /teams/:id/stats               Team profile (stats, ELO history, recent matches)
+GET  /predictions/edges             Market edge opportunities
+POST /datasets/generate             Export dataset (CSV or JSON)
+POST /data/fetch                    Trigger external API sync (optional, needs API key)
+POST /predictions/generate          Re-run prediction engine
+```
+
+Example:
+```bash
+curl http://localhost:3000/matches/upcoming?sport=football
+curl http://localhost:3000/predictions/edges
+curl http://localhost:3000/teams/epl_1/stats
+```
+
+---
+
+## Prediction Model
+
+### ELO Rating System
+- Starting ratings: EPL teams ~1200–1510; NBA teams ~1170–1540
+- Home advantage: +100 ELO points
+- Goal/point-difference multiplier on updates
+- Season progression tracked in `elo_history` table
+
+### Ensemble Model (three components)
+| Model | Weight | Description |
+|-------|--------|-------------|
+| ELO-based | 50% | Pure ELO rating differential |
+| Head-to-head | 30% | Historical matchup record with mean-regression |
+| Form-based | 20% | Sigmoid of ELO diff with home bonus |
+
+### Football draw handling
+`draw_probability = 0.25` (base), then home/away scaled proportionally and normalised to sum to 1.
+
+### Market edges
+`edge = our_probability − (1 / market_odds)`; only edges > 5% surface in the Edge Finder.
+
+---
+
+## CLI Commands
+
+```bash
+cargo run -- serve --port 3000    # Start API server (default)
+cargo run -- init-db              # Create schema only
+cargo run -- fetch --sport all    # Fetch from external APIs (needs API key)
+cargo run -- predict              # Regenerate predictions
+cargo run -- team --name Arsenal  # Query team from terminal
+```
+
+---
+
+## Environment Variables
+
+```bash
+# backend/.env (optional — defaults work without it)
+DATABASE_URL=sqlite:../data/oddsforge.db
+FOOTBALL_DATA_API_KEY=your_key   # Only needed for live EPL data
+RUST_LOG=info
+```
+
+---
+
+## Seed Data (no API key needed)
+
+| Category | Count |
+|----------|-------|
+| EPL teams | 20 (all 2025-26 clubs) |
+| NBA teams | 30 (full league) |
+| Historical matches | 30 (EPL + NBA, with realistic scores) |
+| Upcoming matches | 30 (next 6 weeks, with predictions) |
+| ELO history points | 84 (top teams, 6-month progression) |
+| Season stats | 50 teams |
+
+---
+
+*Built with Rust + React — ELO-powered sports prediction platform*

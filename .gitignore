@@ -1,0 +1,33 @@
+# Rust build artifacts
+backend/target/
+backend/.env
+
+# Node.js
+frontend/node_modules/
+frontend/build/
+
+# SQLite databases
+data/*.db
+data/exports/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+*.DS_Store
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript cache
+*.tsbuildinfo
