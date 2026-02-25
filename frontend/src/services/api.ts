@@ -61,6 +61,9 @@ export interface Edge {
   market_away_odds: number;
   market_draw_odds?: number;
   edge_value: number;
+  is_live_odds: boolean;
+  bookmaker?: string;
+  odds_fetched_at?: string;
 }
 
 export interface ApiResponse<T> {

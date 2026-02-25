@@ -12,6 +12,7 @@ primary_region = "lhr"
 # Secrets (set via `fly secrets set`, never committed to git):
 #   BALLDONTLIE_API_KEY=...
 #   FOOTBALL_DATA_API_KEY=...
+#   ODDS_API_KEY=...          ← The Odds API (500 free req/month, throttled to 2/day internally)
 
 [http_service]
   internal_port        = 3000

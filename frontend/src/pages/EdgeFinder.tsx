@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Target, TrendingUp, AlertTriangle, RefreshCw, Info, ChevronUp, ChevronDown } from 'lucide-react';
+import { Target, TrendingUp, AlertTriangle, RefreshCw, Info, ChevronUp, ChevronDown, Zap } from 'lucide-react';
 import { apiService, Edge } from '../services/api';
-import { format } from 'date-fns';
+import { format, formatDistanceToNow } from 'date-fns';
 
 type SortKey = 'match' | 'our_home' | 'market_home' | 'edge' | 'confidence';
 type SortDir = 'asc' | 'desc';
@@ -93,13 +93,21 @@ const EdgeFinder: React.FC = () => {
         </div>
       )}
 
-      <div className="info-banner">
-        <Info size={18} />
-        <div>
-          <strong>Simulated market odds</strong> — in production these come from live betting APIs.
-          Edge = (Our probability) − (Market implied probability).
-        </div>
-      </div>
+      {(() => {
+        const liveCount = edges.filter(e => e.is_live_odds).length;
+        const simCount  = edges.length - liveCount;
+        return (
+          <div className="info-banner">
+            <Info size={18} />
+            <div>
+              {liveCount > 0
+                ? <><strong style={{ color: 'var(--accent)' }}><Zap size={13} style={{ display: 'inline', verticalAlign: 'middle' }} /> Live market odds</strong> from The Odds API ({liveCount} match{liveCount !== 1 ? 'es' : ''}).{simCount > 0 ? ` ${simCount} simulated.` : ''} Edge = Our probability − devigged market probability.</>
+                : <><strong>Simulated market odds</strong> — live odds will appear once The Odds API syncs. Edge = (Our probability) − (Market implied probability).</>
+              }
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Summary stats */}
       <div className="stats-grid">
@@ -137,8 +145,8 @@ const EdgeFinder: React.FC = () => {
         ) : edges.length === 0 ? (
           <div className="empty-state">
             <Target size={48} />
-            <h3>No significant edges found</h3>
-            <p>Generate predictions first or check back when new matches are scheduled</p>
+            <h3>No edges found yet</h3>
+            <p>Live market odds sync from The Odds API every 12 hours. Once synced, this page shows matches where our model disagrees with the market by &gt;3%.</p>
           </div>
         ) : (
           <div className="edges-table-wrapper">
@@ -197,10 +205,31 @@ const EdgeFinder: React.FC = () => {
                       </td>
                       <td>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 2, fontSize: '0.82rem' }}>
-                          <span>H: {fmtOdds(edge.market_home_odds)}</span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                            <span>H: {fmtOdds(edge.market_home_odds)}</span>
+                            {edge.is_live_odds && (
+                              <span style={{
+                                background: 'var(--accent)',
+                                color: '#000',
+                                fontSize: '0.65rem',
+                                fontWeight: 700,
+                                padding: '1px 5px',
+                                borderRadius: 4,
+                                letterSpacing: '0.03em',
+                              }}>LIVE</span>
+                            )}
+                          </div>
                           <span style={{ color: 'var(--text-muted)' }}>A: {fmtOdds(edge.market_away_odds)}</span>
                           {edge.market_draw_odds && (
                             <span style={{ color: 'var(--text-muted)' }}>D: {fmtOdds(edge.market_draw_odds)}</span>
+                          )}
+                          {edge.bookmaker && (
+                            <span style={{ color: 'var(--accent-light)', fontSize: '0.72rem' }}>
+                              {edge.bookmaker}
+                              {edge.odds_fetched_at && (
+                                <> · {formatDistanceToNow(new Date(edge.odds_fetched_at), { addSuffix: true })}</>
+                              )}
+                            </span>
                           )}
                         </div>
                       </td>

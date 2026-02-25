@@ -5,7 +5,7 @@ use uuid::Uuid;
 // use nalgebra::{DVector, DMatrix}; // For future advanced statistical models
 // use statrs::distribution::{Normal, ContinuousCDF}; // For future probabilistic models
 
-use crate::db::{get_team_by_id, insert_prediction, get_prediction_by_match_id};
+use crate::db::{get_team_by_id, insert_prediction, get_prediction_by_match_id, get_market_odds};
 use crate::models::{Match, Prediction, Team};
 use crate::services::EloCalculator;
 
@@ -95,18 +95,14 @@ impl PredictionEngine {
         let normalized_away = final_away_prob / total;
         let normalized_draw = final_draw_prob.map(|d| d / total);
 
-        // Calculate confidence score based on model agreement
-        let confidence = self.calculate_confidence_score(
-            (elo_home_prob, elo_away_prob, elo_draw_prob),
-            (h2h_home_prob, h2h_away_prob, h2h_draw_prob),
-            (form_home_prob, form_away_prob, form_draw_prob),
-        );
+        // NBA rest-day adjustment (compute once, reuse for both final probs and confidence).
+        let rest_adj = if match_data.sport == "basketball" {
+            self.rest_day_advantage(pool, match_data).await.unwrap_or(0.0)
+        } else {
+            0.0
+        };
 
-        // Apply rest-day adjustment for NBA — back-to-backs are a major predictive signal.
-        // Research: each net rest day is worth ~2.5 pp in win probability (capped at ±3 days).
-        // Football is excluded: rest effects are smaller and partly captured by form already.
-        let (final_home, final_away) = if match_data.sport == "basketball" {
-            let rest_adj = self.rest_day_advantage(pool, match_data).await.unwrap_or(0.0);
+        let (final_home, final_away) = if rest_adj != 0.0 {
             let adj_home = (normalized_home + rest_adj).max(0.01);
             let adj_away = (normalized_away - rest_adj).max(0.01);
             let sum = adj_home + adj_away;
@@ -114,6 +110,21 @@ impl PredictionEngine {
         } else {
             (normalized_home, normalized_away)
         };
+
+        // Confidence: blend prediction strength (primary) + model agreement (secondary).
+        //
+        // Old formula was inverted: strong ELO favourites disagreed with the league-average
+        // H2H/form fallbacks → high std_dev → low confidence for strong predictions.
+        // New formula: a decisive ensemble + agreeing models = high confidence.
+        let home_probs = [elo_home_prob, h2h_home_prob, form_home_prob];
+        let mean_hp = home_probs.iter().sum::<f64>() / 3.0;
+        let std_dev = (home_probs.iter().map(|&p| (p - mean_hp).powi(2)).sum::<f64>() / 3.0).sqrt();
+        let agreement = (1.0 - std_dev / 0.15).clamp(0.0, 1.0);
+
+        let best_prob = final_home.max(final_away).max(normalized_draw.unwrap_or(0.0));
+        let strength = ((best_prob - 0.5) * 2.5).clamp(0.0, 1.0);
+
+        let confidence = (0.40_f64 + 0.35 * strength + 0.25 * agreement).clamp(0.40, 0.95);
 
         Ok(Prediction {
             id: Uuid::new_v4().to_string(),
@@ -371,44 +382,57 @@ impl PredictionEngine {
         confidence
     }
 
-    /// Generate market edge analysis
+    /// Generate market edge analysis using real odds from The Odds API.
+    ///
+    /// Simulated odds are deliberately NOT used as a fallback — the previous simulated
+    /// formula (market = our_prob ± fixed offset) had zero overround after devigging,
+    /// which made every match show an identical 5% edge regardless of teams.
+    /// Real edges only exist when we have genuine market disagreement.
     pub async fn find_market_edges(&self, pool: &SqlitePool) -> Result<Vec<crate::models::Edge>> {
-        // This would integrate with betting APIs to compare our predictions with market odds
-        // For now, we'll generate mock edges for demonstration
-        
         let upcoming_matches = crate::db::get_upcoming_matches(pool, None).await?;
         let mut edges = Vec::new();
 
         for match_data in upcoming_matches {
-            if let Some(our_prediction) = get_prediction_by_match_id(pool, &match_data.id).await? {
-                // Mock market odds (in reality, these would come from betting APIs)
-                let market_home_odds = self.probability_to_odds(our_prediction.home_win_probability + 0.1);
-                let market_away_odds = self.probability_to_odds(our_prediction.away_win_probability - 0.05);
-                let market_draw_odds = our_prediction.draw_probability.map(|p| self.probability_to_odds(p - 0.05));
+            let Some(our_prediction) = get_prediction_by_match_id(pool, &match_data.id).await? else {
+                continue;
+            };
 
-                // Calculate edge value (Kelly criterion could be used here)
-                let home_edge = self.calculate_edge_value(our_prediction.home_win_probability, market_home_odds);
-                let away_edge = self.calculate_edge_value(our_prediction.away_win_probability, market_away_odds);
-                
-                let max_edge = home_edge.max(away_edge);
+            // Skip if no real market odds in DB yet
+            let Some(live) = get_market_odds(pool, &match_data.id).await.ok().flatten() else {
+                continue;
+            };
 
-                if max_edge > 0.05 { // Only include significant edges
-                    edges.push(crate::models::Edge {
-                        match_id: match_data.id.clone(),
-                        match_info: match_data,
-                        our_prediction,
-                        market_home_odds,
-                        market_away_odds,
-                        market_draw_odds,
-                        edge_value: max_edge,
-                    });
-                }
+            // Devig: remove bookmaker overround to get true implied probabilities
+            let (implied_home, implied_draw, implied_away) =
+                devig(live.home_odds, live.draw_odds, live.away_odds);
+
+            // Edge = our probability − devigged market probability (positive = value bet)
+            let home_edge = our_prediction.home_win_probability - implied_home;
+            let away_edge = our_prediction.away_win_probability - implied_away;
+            let draw_edge = match (our_prediction.draw_probability, implied_draw) {
+                (Some(ours), Some(mkt)) => ours - mkt,
+                _ => 0.0,
+            };
+
+            let max_edge = home_edge.max(away_edge).max(draw_edge);
+
+            if max_edge > 0.03 {
+                edges.push(crate::models::Edge {
+                    match_id: match_data.id.clone(),
+                    match_info: match_data,
+                    our_prediction,
+                    market_home_odds: live.home_odds,
+                    market_away_odds: live.away_odds,
+                    market_draw_odds: live.draw_odds,
+                    edge_value: max_edge,
+                    is_live_odds: true,
+                    bookmaker: Some(live.bookmaker),
+                    odds_fetched_at: Some(live.fetched_at),
+                });
             }
         }
 
-        // Sort by edge value, highest first
         edges.sort_by(|a, b| b.edge_value.partial_cmp(&a.edge_value).unwrap_or(std::cmp::Ordering::Equal));
-        
         Ok(edges)
     }
 
@@ -421,7 +445,7 @@ impl PredictionEngine {
         }
     }
 
-    /// Calculate betting edge value
+    /// Calculate betting edge value (kept for simulated-odds path)
     fn calculate_edge_value(&self, our_probability: f64, market_odds: f64) -> f64 {
         let implied_market_probability = 1.0 / market_odds;
         (our_probability - implied_market_probability).max(0.0)
@@ -493,7 +517,7 @@ impl PredictionEngine {
     }
 
     /// Collect features for machine learning models
-    async fn collect_team_features(&self, 
+    async fn collect_team_features(&self,
         _pool: &SqlitePool,
         home_team: &Team,
         away_team: &Team,
@@ -505,7 +529,20 @@ impl PredictionEngine {
             home_team.elo_rating / 1000.0, // Normalized home team strength
             away_team.elo_rating / 1000.0, // Normalized away team strength
         ];
-        
+
         Ok(features)
     }
+}
+
+/// Remove bookmaker overround from decimal odds, returning true implied probabilities.
+/// Works for both 2-outcome (basketball) and 3-outcome (football) markets.
+fn devig(home_odds: f64, draw_odds: Option<f64>, away_odds: f64) -> (f64, Option<f64>, f64) {
+    let h = if home_odds > 0.0 { 1.0 / home_odds } else { 0.0 };
+    let d = draw_odds.map(|x| if x > 0.0 { 1.0 / x } else { 0.0 });
+    let a = if away_odds > 0.0 { 1.0 / away_odds } else { 0.0 };
+    let total = h + d.unwrap_or(0.0) + a;
+    if total <= 0.0 {
+        return (0.5, draw_odds.map(|_| 0.25), 0.5);
+    }
+    (h / total, d.map(|x| x / total), a / total)
 }

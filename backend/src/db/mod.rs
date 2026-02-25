@@ -153,14 +153,43 @@ pub async fn init_database_with_pool(pool: &SqlitePool) -> Result<()> {
     .await?;
 
     // Create indexes
+    // market_odds: one row per match, best available odds from The Odds API
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS market_odds (
+            match_id    TEXT PRIMARY KEY,
+            bookmaker   TEXT NOT NULL,
+            home_odds   REAL NOT NULL,
+            draw_odds   REAL,
+            away_odds   REAL NOT NULL,
+            fetched_at  TEXT NOT NULL,
+            FOREIGN KEY (match_id) REFERENCES matches (id)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // odds_fetch_log: tracks last successful API call per sport_key to avoid burning quota
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS odds_fetch_log (
+            sport_key    TEXT PRIMARY KEY,
+            last_fetched TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(match_date)")
         .execute(&pool)
         .await?;
-    
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_matches_status ON matches(status)")
         .execute(&pool)
         .await?;
-    
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_teams_sport_league ON teams(sport, league)")
         .execute(&pool)
         .await?;
@@ -460,6 +489,56 @@ pub async fn get_team_recent_matches(pool: &SqlitePool, team_id: &str, limit: i6
         });
     }
     Ok(matches)
+}
+
+// Market odds operations
+
+pub async fn upsert_market_odds(
+    pool: &SqlitePool,
+    match_id: &str,
+    bookmaker: &str,
+    home_odds: f64,
+    draw_odds: Option<f64>,
+    away_odds: f64,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"INSERT INTO market_odds (match_id, bookmaker, home_odds, draw_odds, away_odds, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(match_id) DO UPDATE SET
+               bookmaker  = excluded.bookmaker,
+               home_odds  = excluded.home_odds,
+               draw_odds  = excluded.draw_odds,
+               away_odds  = excluded.away_odds,
+               fetched_at = excluded.fetched_at"#,
+    )
+    .bind(match_id)
+    .bind(bookmaker)
+    .bind(home_odds)
+    .bind(draw_odds)
+    .bind(away_odds)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_market_odds(pool: &SqlitePool, match_id: &str) -> Result<Option<crate::models::MarketOdds>> {
+    let row = sqlx::query(
+        "SELECT match_id, bookmaker, home_odds, draw_odds, away_odds, fetched_at FROM market_odds WHERE match_id = ?"
+    )
+    .bind(match_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| crate::models::MarketOdds {
+        match_id:   r.get("match_id"),
+        bookmaker:  r.get("bookmaker"),
+        home_odds:  r.get("home_odds"),
+        draw_odds:  r.get("draw_odds"),
+        away_odds:  r.get("away_odds"),
+        fetched_at: r.get("fetched_at"),
+    }))
 }
 
 pub async fn insert_elo_history(

@@ -76,7 +76,21 @@ pub struct Edge {
     pub market_home_odds: f64,
     pub market_away_odds: f64,
     pub market_draw_odds: Option<f64>,
-    pub edge_value: f64, // How much our model disagrees with market
+    pub edge_value: f64,
+    /// True when odds come from The Odds API, false when simulated
+    pub is_live_odds: bool,
+    pub bookmaker: Option<String>,
+    pub odds_fetched_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketOdds {
+    pub match_id: String,
+    pub bookmaker: String,
+    pub home_odds: f64,
+    pub draw_odds: Option<f64>,
+    pub away_odds: f64,
+    pub fetched_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

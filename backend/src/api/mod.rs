@@ -18,7 +18,7 @@ use crate::db::{
     seed_data,
 };
 use crate::models::{ApiResponse, DatasetRequest, UpcomingMatchWithPrediction, TeamProfile, Team};
-use crate::services::{DataFetcher, EloCalculator, PredictionEngine};
+use crate::services::{DataFetcher, EloCalculator, PredictionEngine, refresh_odds_if_stale};
 
 pub async fn serve(port: u16) -> anyhow::Result<()> {
     let pool = create_pool().await?;
@@ -124,6 +124,15 @@ async fn background_scheduler(pool: SqlitePool) {
         rebuild_elo(&pool).await;
         compute_season_stats(&pool).await;
         refresh_predictions(&pool).await;
+
+        // ── Odds refresh (The Odds API) ───────────────────────────────────────
+        // Internally throttled to ≤ 1 call/sport/12 h — safe with 500 req/month budget
+        if let Ok(api_key) = std::env::var("ODDS_API_KEY") {
+            let n = refresh_odds_if_stale(&pool, &api_key).await;
+            if n > 0 {
+                tracing::info!("Odds refresh: {} matches updated", n);
+            }
+        }
     }
 }
 
