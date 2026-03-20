@@ -46,3 +46,4 @@ thiserror = "1.0"
 
 # CSV export
 csv = "1.1"
+rand = "0.10.0"
