@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: oddsforge-backend
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free
+    envVars:
+      # SQLite lives in /tmp on Render's ephemeral disk.
+      # Data is re-fetched from APIs by the background scheduler within ~60s of startup.
+      - key: DATABASE_URL
+        value: sqlite:////tmp/oddsforge.db
+      - key: RUST_LOG
+        value: info
+      # Set these as secret env vars in the Render dashboard — do NOT hardcode keys here.
+      - key: BALLDONTLIE_API_KEY
+        sync: false
+      - key: FOOTBALL_DATA_API_KEY
+        sync: false
+      - key: ODDS_API_KEY
+        sync: false

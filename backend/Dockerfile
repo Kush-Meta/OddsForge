@@ -38,4 +38,5 @@ ENV DATABASE_URL=sqlite:///data/oddsforge.db
 ENV RUST_LOG=info
 
 EXPOSE 3000
-CMD ["./oddsforge-backend"]
+# Use PORT env var when set (Render injects it); fall back to 3000 (Fly.io / local)
+CMD ["sh", "-c", "./oddsforge-backend serve --port ${PORT:-3000}"]
