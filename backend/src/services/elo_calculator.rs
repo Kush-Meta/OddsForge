@@ -21,41 +21,61 @@ impl EloCalculator {
         1.0 / (1.0 + 10f64.powf((rating_b - rating_a) / 400.0))
     }
 
-    /// Update ELO ratings after a match
-    pub fn update_ratings(&self, 
-        home_rating: f64, 
-        away_rating: f64, 
-        home_score: i32, 
+    /// Update ELO ratings after a match.
+    ///
+    /// Sport-specific tuning:
+    /// - Football: K=32, +100 HCA, soccer goal-difference multiplier
+    /// - Basketball: K=20, +75 HCA, logarithmic point-margin multiplier
+    pub fn update_ratings(&self,
+        home_rating: f64,
+        away_rating: f64,
+        home_score: i32,
         away_score: i32,
-        is_neutral_venue: bool
+        is_neutral_venue: bool,
     ) -> (f64, f64) {
-        let home_advantage = if is_neutral_venue { 0.0 } else { 100.0 }; // Home advantage bonus
-        let adjusted_home_rating = home_rating + home_advantage;
-        
-        let expected_home = Self::expected_score(adjusted_home_rating, away_rating);
+        self.update_ratings_for_sport(home_rating, away_rating, home_score, away_score, is_neutral_venue, "football")
+    }
+
+    /// Sport-aware ELO update used internally and by the NBA path.
+    pub fn update_ratings_for_sport(
+        &self,
+        home_rating: f64,
+        away_rating: f64,
+        home_score: i32,
+        away_score: i32,
+        is_neutral_venue: bool,
+        sport: &str,
+    ) -> (f64, f64) {
+        let (k, hca) = if sport == "basketball" {
+            (20.0_f64, if is_neutral_venue { 0.0 } else { 75.0 })
+        } else {
+            (self.k_factor, if is_neutral_venue { 0.0 } else { 100.0 })
+        };
+
+        let adjusted_home = home_rating + hca;
+        let expected_home = Self::expected_score(adjusted_home, away_rating);
         let expected_away = 1.0 - expected_home;
-        
+
         let actual_home = match home_score.cmp(&away_score) {
-            std::cmp::Ordering::Greater => 1.0, // Win
-            std::cmp::Ordering::Equal => 0.5,   // Draw
-            std::cmp::Ordering::Less => 0.0,    // Loss
+            std::cmp::Ordering::Greater => 1.0,
+            std::cmp::Ordering::Equal   => 0.5,
+            std::cmp::Ordering::Less    => 0.0,
         };
         let actual_away = 1.0 - actual_home;
-        
-        // Apply goal difference multiplier for more accurate ratings
-        let goal_diff = (home_score - away_score).abs() as f64;
-        let goal_multiplier = if goal_diff <= 1.0 {
-            1.0
-        } else if goal_diff == 2.0 {
-            1.5
+
+        let margin = (home_score - away_score).abs();
+        let mov_mult = if sport == "basketball" {
+            // Logarithmic: captures meaningful margins without over-rewarding blowouts
+            crate::services::NbaPredictor::mov_multiplier(margin)
         } else {
-            (11.0 + goal_diff) / 8.0
+            // Soccer goal-difference multiplier (original formula)
+            let gd = margin as f64;
+            if gd <= 1.0 { 1.0 } else if gd == 2.0 { 1.5 } else { (11.0 + gd) / 8.0 }
         };
-        
-        let new_home_rating = home_rating + self.k_factor * goal_multiplier * (actual_home - expected_home);
-        let new_away_rating = away_rating + self.k_factor * goal_multiplier * (actual_away - expected_away);
-        
-        (new_home_rating, new_away_rating)
+
+        let new_home = home_rating + k * mov_mult * (actual_home - expected_home);
+        let new_away = away_rating + k * mov_mult * (actual_away - expected_away);
+        (new_home, new_away)
     }
 
     /// Calculate win probability based on ELO ratings
@@ -102,13 +122,14 @@ impl EloCalculator {
         let away_team = get_team_by_id(pool, &match_data.away_team_id).await?
             .ok_or_else(|| anyhow::anyhow!("Away team not found"))?;
 
-        // Calculate new ratings
-        let (new_home_rating, new_away_rating) = self.update_ratings(
+        // Calculate new ratings (sport-aware: NBA uses K=20 and +75 HCA)
+        let (new_home_rating, new_away_rating) = self.update_ratings_for_sport(
             home_team.elo_rating,
             away_team.elo_rating,
             home_score,
             away_score,
-            false, // Assume home venue advantage
+            false,
+            &match_data.sport,
         );
 
         let home_team_name = home_team.name.clone();

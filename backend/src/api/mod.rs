@@ -15,10 +15,10 @@ use crate::db::{
     clear_all_data, create_pool, get_all_teams, get_elo_history, get_finished_matches_ordered,
     get_team_by_id, get_team_current_stats, get_team_recent_matches, get_teams_by_league,
     get_upcoming_matches, get_prediction_by_match_id, init_database_with_pool, insert_elo_history,
-    seed_data,
+    get_players_by_team, seed_data,
 };
-use crate::models::{ApiResponse, DatasetRequest, UpcomingMatchWithPrediction, TeamProfile, Team};
-use crate::services::{DataFetcher, EloCalculator, PredictionEngine, refresh_odds_if_stale};
+use crate::models::{ApiResponse, DatasetRequest, EloComponent, FormComponent, H2hComponent, MatchAnalysis, NbaPlayerStats, ScheduleComponent, UpcomingMatchWithPrediction, TeamProfile, Team};
+use crate::services::{DataFetcher, EloCalculator, NbaPlayersFetcher, NbaStatsFetcher, PredictionEngine, refresh_odds_if_stale};
 
 pub async fn serve(port: u16) -> anyhow::Result<()> {
     let pool = create_pool().await?;
@@ -49,6 +49,30 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
             } else {
                 tracing::info!("No API keys — seeding with sample data");
                 let _ = seed_data(&init_pool).await;
+            }
+        }
+
+        // Fetch NBA advanced stats on startup (6-hour throttle enforced internally)
+        if NbaStatsFetcher::should_refresh(&init_pool).await {
+            match NbaStatsFetcher::new() {
+                Ok(fetcher) => {
+                    if let Err(e) = fetcher.fetch_and_store(&init_pool).await {
+                        tracing::warn!("Initial NBA advanced stats fetch failed: {}", e);
+                    }
+                }
+                Err(e) => tracing::warn!("Could not build NbaStatsFetcher: {}", e),
+            }
+        }
+
+        // Fetch NBA player rosters & season averages (24-hour throttle enforced internally)
+        if NbaPlayersFetcher::should_refresh(&init_pool).await {
+            match NbaPlayersFetcher::new() {
+                Ok(fetcher) => {
+                    if let Err(e) = fetcher.fetch_and_store(&init_pool).await {
+                        tracing::warn!("Initial NBA player stats fetch failed: {}", e);
+                    }
+                }
+                Err(e) => tracing::warn!("Could not build NbaPlayersFetcher: {}", e),
             }
         }
 
@@ -117,6 +141,31 @@ async fn background_scheduler(pool: SqlitePool) {
                 if let Err(e) = fetcher.fetch_nba_teams(&pool).await {
                     tracing::error!("NBA team refresh failed: {}", e);
                 }
+            }
+        }
+
+        // ── NBA Advanced Stats (stats.nba.com, no API key needed) ────────────
+        // Refresh every 6 hours; the fetcher checks staleness internally.
+        if NbaStatsFetcher::should_refresh(&pool).await {
+            match NbaStatsFetcher::new() {
+                Ok(fetcher) => {
+                    if let Err(e) = fetcher.fetch_and_store(&pool).await {
+                        tracing::warn!("NBA advanced stats refresh failed: {}", e);
+                    }
+                }
+                Err(e) => tracing::warn!("Could not build NbaStatsFetcher: {}", e),
+            }
+        }
+
+        // ── NBA player stats (24-hour throttle) ──────────────────────────────
+        if NbaPlayersFetcher::should_refresh(&pool).await {
+            match NbaPlayersFetcher::new() {
+                Ok(fetcher) => {
+                    if let Err(e) = fetcher.fetch_and_store(&pool).await {
+                        tracing::warn!("NBA player stats refresh failed: {}", e);
+                    }
+                }
+                Err(e) => tracing::warn!("Could not build NbaPlayersFetcher: {}", e),
             }
         }
 
@@ -323,6 +372,8 @@ fn create_router() -> Router<SqlitePool> {
         .route("/data/fetch", post(fetch_data_handler))
         .route("/data/refresh", post(refresh_all_data_handler))
         .route("/predictions/generate", post(generate_predictions_handler))
+        .route("/matches/{id}/analysis", get(get_match_analysis_handler))
+        .route("/teams/{id}/players", get(get_team_players_handler))
         // Serve generated export files (CSV / JSON) from the exports directory
         .nest_service("/downloads", ServeDir::new("../data/exports"))
         .layer(
@@ -433,6 +484,21 @@ async fn get_team_stats_handler(
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!("Failed to fetch team stats: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+// GET /teams/:id/players - NBA player roster with season averages
+async fn get_team_players_handler(
+    State(pool): State<SqlitePool>,
+    Path(team_id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<NbaPlayerStats>>>, StatusCode> {
+    let season = "2025";
+    match get_players_by_team(&pool, &team_id, season).await {
+        Ok(players) => Ok(Json(ApiResponse::success(players))),
+        Err(e) => {
+            tracing::error!("Failed to fetch players for {}: {}", team_id, e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -583,6 +649,215 @@ async fn generate_predictions_handler(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+// GET /matches/:id/analysis — per-component prediction breakdown
+async fn get_match_analysis_handler(
+    State(pool): State<SqlitePool>,
+    Path(match_id): Path<String>,
+) -> Result<Json<ApiResponse<MatchAnalysis>>, StatusCode> {
+    match compute_match_analysis(&pool, &match_id).await {
+        Ok(Some(a)) => Ok(Json(ApiResponse::success(a))),
+        Ok(None)    => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Match analysis failed: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn compute_match_analysis(pool: &SqlitePool, match_id: &str) -> anyhow::Result<Option<MatchAnalysis>> {
+    use sqlx::Row;
+
+    let row = sqlx::query("SELECT * FROM matches WHERE id = ?")
+        .bind(match_id).fetch_optional(pool).await?;
+    let r = match row { Some(r) => r, None => return Ok(None) };
+
+    let home_id:   String = r.try_get("home_team_id")?;
+    let away_id:   String = r.try_get("away_team_id")?;
+    let home_name: String = r.try_get("home_team_name")?;
+    let away_name: String = r.try_get("away_team_name")?;
+    let sport:     String = r.try_get("sport")?;
+    let date_str:  String = r.try_get("match_date")?;
+    let match_date = chrono::DateTime::parse_from_rfc3339(&date_str)?.with_timezone(&chrono::Utc);
+
+    // ── ELO ──────────────────────────────────────────────────────────────────
+    let home_elo: f64 = sqlx::query_scalar("SELECT elo_rating FROM teams WHERE id = ?")
+        .bind(&home_id).fetch_optional(pool).await?.unwrap_or(1200.0);
+    let away_elo: f64 = sqlx::query_scalar("SELECT elo_rating FROM teams WHERE id = ?")
+        .bind(&away_id).fetch_optional(pool).await?.unwrap_or(1200.0);
+
+    let hca = if sport == "basketball" { 75.0 } else { 100.0 };
+    let elo_diff = home_elo - away_elo;
+    let elo_home_prob = 1.0 / (1.0 + 10f64.powf((away_elo - (home_elo + hca)) / 400.0));
+    let elo_narrative = if elo_diff > 0.0 {
+        format!("{} carries a {:.0}-point ELO edge built from this season's results", home_name, elo_diff)
+    } else {
+        format!("{} is the stronger team by ELO, arriving with a {:.0}-point advantage", away_name, elo_diff.abs())
+    };
+
+    // ── Form ─────────────────────────────────────────────────────────────────
+    struct FormResult { avg: f64, n: i64 }
+
+    async fn rolling_margin(pool: &SqlitePool, team_id: &str, is_home: bool, sport: &str) -> FormResult {
+        let (col, opp_col, filter_col) = if is_home {
+            ("home_score", "away_score", "home_team_id")
+        } else {
+            ("away_score", "home_score", "away_team_id")
+        };
+        let sql = format!(
+            "SELECT {col} - {opp_col} as margin FROM matches
+             WHERE {filter_col} = ? AND status = 'finished'
+               AND {col} IS NOT NULL AND sport = ?
+             ORDER BY match_date DESC LIMIT 15",
+        );
+        let rows = sqlx::query(&sql).bind(team_id).bind(sport).fetch_all(pool).await.unwrap_or_default();
+        let n = rows.len() as i64;
+        if n == 0 { return FormResult { avg: 0.0, n: 0 }; }
+        let sum: f64 = rows.iter().enumerate().map(|(i, row)| {
+            let margin: i32 = row.try_get("margin").unwrap_or(0);
+            let decay = 0.90_f64.powi(i as i32);
+            margin as f64 * decay
+        }).sum();
+        let weight: f64 = (0..n).map(|i| 0.90_f64.powi(i as i32)).sum();
+        FormResult { avg: sum / weight, n }
+    }
+
+    let home_form = rolling_margin(pool, &home_id, true,  &sport).await;
+    let away_form = rolling_margin(pool, &away_id, false, &sport).await;
+
+    let hca_pts = if sport == "basketball" { 3.0_f64 } else { 0.0_f64 };
+    let coeff   = if sport == "basketball" { 0.10_f64 } else { 2.5_f64 };
+    let form_diff = home_form.avg - away_form.avg + hca_pts;
+    let form_home_prob = 1.0 / (1.0 + (-form_diff * coeff).exp());
+
+    let form_narrative = if home_form.n > 0 && away_form.n > 0 {
+        format!(
+            "{} averages {:+.1} pts/gm at home (last {}). {} averages {:+.1} pts/gm away (last {}).",
+            home_name, home_form.avg, home_form.n,
+            away_name, away_form.avg, away_form.n
+        )
+    } else {
+        "Insufficient form data — using league average".into()
+    };
+
+    // ── H2H ──────────────────────────────────────────────────────────────────
+    let h2h_rows = sqlx::query(
+        "SELECT home_team_id, home_score, away_score FROM matches
+         WHERE ((home_team_id = ? AND away_team_id = ?)
+             OR (home_team_id = ? AND away_team_id = ?))
+           AND status = 'finished' AND sport = ?
+         ORDER BY match_date DESC LIMIT 10",
+    )
+    .bind(&home_id).bind(&away_id).bind(&away_id).bind(&home_id).bind(&sport)
+    .fetch_all(pool).await?;
+
+    let (mut hw, mut aw, mut draws) = (0i64, 0i64, 0i64);
+    for row in &h2h_rows {
+        let rhi: String = row.try_get("home_team_id").unwrap_or_default();
+        let hs: i32 = row.try_get("home_score").unwrap_or(0);
+        let aws: i32 = row.try_get("away_score").unwrap_or(0);
+        if hs > aws  { if rhi == home_id { hw += 1; } else { aw += 1; } }
+        else if hs < aws { if rhi == away_id { hw += 1; } else { aw += 1; } }
+        else { draws += 1; }
+    }
+    let total_h2h = hw + aw + draws;
+    let h2h_home_prob = if total_h2h == 0 {
+        if sport == "basketball" { 0.55 } else { 0.46 }
+    } else {
+        let raw = hw as f64 / total_h2h as f64;
+        let cred = (total_h2h as f64 / 20.0).min(0.70);
+        raw * cred + 0.55 * (1.0 - cred)
+    };
+    let h2h_narrative = if total_h2h == 0 {
+        "No recent head-to-head history available".into()
+    } else {
+        format!(
+            "{home_name} won {hw} of the last {total_h2h} meetings (lost {aw}, drew {draws})"
+        )
+    };
+
+    // ── Schedule ─────────────────────────────────────────────────────────────
+    async fn last_game_days(pool: &SqlitePool, team_id: &str, before: chrono::DateTime<chrono::Utc>) -> i64 {
+        let row = sqlx::query(
+            "SELECT match_date FROM matches WHERE (home_team_id = ? OR away_team_id = ?)
+             AND status = 'finished' AND match_date < ? ORDER BY match_date DESC LIMIT 1",
+        )
+        .bind(team_id).bind(team_id).bind(before.to_rfc3339())
+        .fetch_optional(pool).await.ok().flatten();
+        row.and_then(|r| {
+            let s: String = r.try_get("match_date").ok()?;
+            let d = chrono::DateTime::parse_from_rfc3339(&s).ok()?;
+            Some((before - d.with_timezone(&chrono::Utc)).num_days().max(0).saturating_sub(1).min(7))
+        }).unwrap_or(3) // well-rested if no prior game
+    }
+
+    async fn consec_away(pool: &SqlitePool, team_id: &str, before: chrono::DateTime<chrono::Utc>) -> i64 {
+        let rows = sqlx::query(
+            "SELECT home_team_id FROM matches WHERE (home_team_id=? OR away_team_id=?)
+             AND status='finished' AND match_date < ? ORDER BY match_date DESC LIMIT 6",
+        )
+        .bind(team_id).bind(team_id).bind(before.to_rfc3339())
+        .fetch_all(pool).await.unwrap_or_default();
+        let mut n = 0i64;
+        for row in &rows {
+            let hid: String = row.try_get("home_team_id").unwrap_or_default();
+            if hid == team_id { break; }
+            n += 1;
+        }
+        n
+    }
+
+    let home_rest = last_game_days(pool, &home_id, match_date).await;
+    let away_rest = last_game_days(pool, &away_id, match_date).await;
+    let away_road = consec_away(pool, &away_id, match_date).await;
+
+    let home_b2b = home_rest == 0;
+    let away_b2b = away_rest == 0;
+    let mut sched_adj = 0.0_f64;
+    if home_b2b { sched_adj -= 0.05; }
+    if away_b2b { sched_adj += 0.05; }
+    if away_road >= 3 { sched_adj += 0.015; }
+
+    let sched_narrative = {
+        let mut parts = Vec::new();
+        if home_b2b { parts.push(format!("{} is on a back-to-back", home_name)); }
+        if away_b2b { parts.push(format!("{} is on a back-to-back", away_name)); }
+        if away_road >= 3 { parts.push(format!("{} is on game {} of a road trip", away_name, away_road + 1)); }
+        if parts.is_empty() { "No significant schedule factors".into() }
+        else { parts.join(". ") }
+    };
+
+    // ── Existing prediction ──────────────────────────────────────────────────
+    let pred = sqlx::query(
+        "SELECT home_win_probability, away_win_probability, draw_probability,
+                confidence_score, model_version FROM predictions
+         WHERE match_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(match_id).fetch_optional(pool).await?;
+
+    let (final_home, final_away, draw_prob, confidence, model_version) = match pred {
+        Some(r) => (
+            r.try_get("home_win_probability").unwrap_or(elo_home_prob),
+            r.try_get("away_win_probability").unwrap_or(1.0 - elo_home_prob),
+            r.try_get("draw_probability").ok().flatten(),
+            r.try_get("confidence_score").unwrap_or(0.5),
+            r.try_get::<String, _>("model_version").unwrap_or_default(),
+        ),
+        None => (elo_home_prob, 1.0 - elo_home_prob, None, 0.5_f64, "none".into()),
+    };
+
+    let is_fallback = model_version.contains("fallback") || sport != "basketball";
+    let (w_elo, w_form, w_h2h) = if is_fallback { (0.40, 0.40, 0.20) } else { (0.20, 0.25, 0.10) };
+
+    Ok(Some(MatchAnalysis {
+        match_id: match_id.into(), home_team_name: home_name, away_team_name: away_name, sport,
+        elo: EloComponent { home_elo, away_elo, diff: elo_diff, home_prob: elo_home_prob, weight: w_elo, narrative: elo_narrative },
+        form: FormComponent { home_avg_margin: home_form.avg, away_avg_margin: away_form.avg, home_games_used: home_form.n, away_games_used: away_form.n, home_prob: form_home_prob, weight: w_form, narrative: form_narrative },
+        h2h: H2hComponent { home_wins: hw, away_wins: aw, draws, total: total_h2h, home_prob: h2h_home_prob, weight: w_h2h, narrative: h2h_narrative },
+        schedule: ScheduleComponent { home_rest_days: home_rest, away_rest_days: away_rest, away_on_back_to_back: away_b2b, home_on_back_to_back: home_b2b, away_consecutive_road: away_road, adjustment: sched_adj, narrative: sched_narrative },
+        model_version, final_home_prob: final_home, final_away_prob: final_away, draw_prob, confidence,
+    }))
 }
 
 // Helper function to generate custom datasets

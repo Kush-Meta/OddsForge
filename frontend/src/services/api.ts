@@ -125,6 +125,19 @@ export const apiService = {
     return response.data.data || 'Success';
   },
 
+  // Team players
+  async getTeamPlayers(teamId: string): Promise<NbaPlayerStats[]> {
+    const response = await api.get<ApiResponse<NbaPlayerStats[]>>(`/teams/${teamId}/players`);
+    return response.data.data || [];
+  },
+
+  // Match analysis
+  async getMatchAnalysis(matchId: string): Promise<MatchAnalysis> {
+    const response = await api.get<ApiResponse<MatchAnalysis>>(`/matches/${matchId}/analysis`);
+    if (!response.data.data) throw new Error(response.data.error || 'No analysis data');
+    return response.data.data;
+  },
+
   // Dataset generation
   async generateDataset(request: {
     sport: string;
@@ -138,5 +151,82 @@ export const apiService = {
     return response.data.data;
   },
 };
+
+// ── NBA Player Stats ─────────────────────────────────────────────────────────
+export interface NbaPlayerStats {
+  player_id: number;
+  team_id: string;
+  first_name: string;
+  last_name: string;
+  position: string;
+  jersey_number?: string;
+  pts: number;
+  reb: number;
+  ast: number;
+  stl: number;
+  blk: number;
+  fg_pct: number;
+  fg3_pct: number;
+  min: string;
+  games_played: number;
+  season: string;
+  fetched_at: string;
+}
+
+// ── Match Analysis (algorithm breakdown) ────────────────────────────────────
+export interface EloComponent {
+  home_elo: number;
+  away_elo: number;
+  diff: number;
+  home_prob: number;
+  weight: number;
+  narrative: string;
+}
+
+export interface FormComponent {
+  home_avg_margin: number;
+  away_avg_margin: number;
+  home_games_used: number;
+  away_games_used: number;
+  home_prob: number;
+  weight: number;
+  narrative: string;
+}
+
+export interface H2hComponent {
+  home_wins: number;
+  away_wins: number;
+  draws: number;
+  total: number;
+  home_prob: number;
+  weight: number;
+  narrative: string;
+}
+
+export interface ScheduleComponent {
+  home_rest_days: number;
+  away_rest_days: number;
+  away_on_back_to_back: boolean;
+  home_on_back_to_back: boolean;
+  away_consecutive_road: number;
+  adjustment: number;
+  narrative: string;
+}
+
+export interface MatchAnalysis {
+  match_id: string;
+  home_team_name: string;
+  away_team_name: string;
+  sport: string;
+  elo: EloComponent;
+  form: FormComponent;
+  h2h: H2hComponent;
+  schedule: ScheduleComponent;
+  model_version: string;
+  final_home_prob: number;
+  final_away_prob: number;
+  draw_prob?: number;
+  confidence: number;
+}
 
 export default apiService;

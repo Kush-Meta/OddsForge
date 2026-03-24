@@ -1397,6 +1397,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "statrs",
+ "strsim",
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",

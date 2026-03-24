@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::db::{get_team_by_id, insert_prediction, get_prediction_by_match_id, get_market_odds};
 use crate::models::{Match, Prediction, Team};
-use crate::services::EloCalculator;
+use crate::services::{EloCalculator, NbaPredictor};
 
 /// Captures recent weighted performance for a team in a specific playing context (home or away).
 struct RollingForm {
@@ -19,12 +19,14 @@ struct RollingForm {
 
 pub struct PredictionEngine {
     elo_calculator: EloCalculator,
+    nba_predictor: NbaPredictor,
 }
 
 impl PredictionEngine {
     pub fn new() -> Self {
         Self {
             elo_calculator: EloCalculator::new(),
+            nba_predictor: NbaPredictor::new(),
         }
     }
 
@@ -51,8 +53,15 @@ impl PredictionEngine {
         Ok(())
     }
 
-    /// Predict match outcome using ensemble of models
+    /// Predict match outcome using ensemble of models.
+    /// NBA games are routed to the dedicated NbaPredictor (5-component ensemble).
+    /// Football games use the existing ELO + H2H + form ensemble.
     pub async fn predict_match_outcome(&self, pool: &SqlitePool, match_data: &Match) -> Result<Prediction> {
+        // ── NBA: delegate to the sport-specific engine ───────────────────────
+        if match_data.sport == "basketball" {
+            return self.nba_predictor.predict(pool, match_data).await;
+        }
+
         let home_team = get_team_by_id(pool, &match_data.home_team_id).await?
             .ok_or_else(|| anyhow::anyhow!("Home team not found"))?;
         let away_team = get_team_by_id(pool, &match_data.away_team_id).await?

@@ -5,13 +5,15 @@ import Dashboard from './pages/Dashboard';
 import EdgeFinder from './pages/EdgeFinder';
 import DatasetBuilder from './pages/DatasetBuilder';
 import TeamProfile from './pages/TeamProfile';
-import './App.css';
+import HowItWorks from './pages/HowItWorks';
+import BouncingBall from './components/BouncingBall';
+import './index.css';
 
 const NAV_ITEMS = [
-  { path: '/',       icon: BarChart3, label: 'Dashboard'      },
-  { path: '/edges',  icon: Target,    label: 'Edge Finder'    },
-  { path: '/dataset',icon: Download,  label: 'Dataset Builder'},
-  { path: '/teams',  icon: Users,     label: 'Teams'          },
+  { path: '/',              icon: BarChart3, label: 'Dashboard'      },
+  { path: '/edges',         icon: Target,    label: 'Edge Finder'    },
+  { path: '/dataset',       icon: Download,  label: 'Dataset Builder'},
+  { path: '/teams',         icon: Users,     label: 'Teams'          },
 ];
 
 const Navbar: React.FC = () => {
@@ -22,8 +24,11 @@ const Navbar: React.FC = () => {
     <nav className="navbar">
       <div className="nav-container">
         <Link to="/" className="nav-brand" onClick={() => setOpen(false)}>
-          <span className="nav-brand-icon" style={{ fontSize: '1.4rem' }}>🎯</span>
-          <span className="nav-brand-text">OddsForge</span>
+          <div className="nav-logo-ring">🎯</div>
+          <span>
+            <span className="nav-brand-text">Odds</span>
+            <span className="nav-brand-accent">Forge</span>
+          </span>
         </Link>
 
         <button className="nav-toggle" onClick={() => setOpen(o => !o)} aria-label="Toggle menu">
@@ -38,10 +43,15 @@ const Navbar: React.FC = () => {
               className={`nav-link ${location.pathname === path ? 'nav-link-active' : ''}`}
               onClick={() => setOpen(false)}
             >
-              <Icon size={18} />
+              <Icon size={16} />
               <span>{label}</span>
             </Link>
           ))}
+        </div>
+
+        <div className="nav-status">
+          <div className="nav-status-dot" />
+          Live
         </div>
       </div>
     </nav>
@@ -54,13 +64,15 @@ const App: React.FC = () => (
       <Navbar />
       <main className="main-content">
         <Routes>
-          <Route path="/"          element={<Dashboard />}     />
-          <Route path="/edges"     element={<EdgeFinder />}    />
-          <Route path="/dataset"   element={<DatasetBuilder />}/>
-          <Route path="/teams"     element={<TeamProfile />}   />
-          <Route path="/teams/:id" element={<TeamProfile />}   />
+          <Route path="/"          element={<Dashboard />}      />
+          <Route path="/edges"     element={<EdgeFinder />}     />
+          <Route path="/dataset"   element={<DatasetBuilder />} />
+          <Route path="/teams"          element={<TeamProfile />}  />
+          <Route path="/teams/:id"      element={<TeamProfile />}  />
+          <Route path="/how-it-works"   element={<HowItWorks />}   />
         </Routes>
       </main>
+      <BouncingBall />
     </div>
   </Router>
 );

@@ -213,7 +213,9 @@ mod tests {
 
     #[test]
     fn test_calculate_win_percentage() {
-        assert_eq!(calculate_win_percentage(3, Some(1), 1), 60.0); // 10 points out of 15 possible
+        // 3W + 1D + 1L → 10 football points out of 15 possible = 66.67%
+        let pct = calculate_win_percentage(3, Some(1), 1);
+        assert!((pct - 66.666_666).abs() < 0.001, "expected ~66.67, got {}", pct);
         assert_eq!(calculate_win_percentage(0, None, 0), 0.0);
     }
 }

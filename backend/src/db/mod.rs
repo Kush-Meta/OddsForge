@@ -182,6 +182,66 @@ pub async fn init_database_with_pool(pool: &SqlitePool) -> Result<()> {
     .execute(&pool)
     .await?;
 
+    // nba_advanced_stats: one row per team, refreshed from stats.nba.com every 6 hours
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS nba_advanced_stats (
+            team_id      TEXT PRIMARY KEY,
+            off_rating   REAL NOT NULL DEFAULT 110.0,
+            def_rating   REAL NOT NULL DEFAULT 110.0,
+            net_rating   REAL NOT NULL DEFAULT 0.0,
+            pace         REAL NOT NULL DEFAULT 100.0,
+            efg_pct      REAL NOT NULL DEFAULT 0.52,
+            opp_efg_pct  REAL NOT NULL DEFAULT 0.52,
+            tov_pct      REAL NOT NULL DEFAULT 0.14,
+            opp_tov_pct  REAL NOT NULL DEFAULT 0.14,
+            oreb_pct     REAL NOT NULL DEFAULT 0.28,
+            opp_oreb_pct REAL NOT NULL DEFAULT 0.28,
+            ft_rate      REAL NOT NULL DEFAULT 0.24,
+            opp_ft_rate  REAL NOT NULL DEFAULT 0.24,
+            games_played INTEGER NOT NULL DEFAULT 0,
+            wins         INTEGER NOT NULL DEFAULT 0,
+            season       TEXT NOT NULL,
+            fetched_at   TEXT NOT NULL,
+            FOREIGN KEY (team_id) REFERENCES teams (id)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // nba_player_stats: one row per player per season, refreshed daily
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS nba_player_stats (
+            player_id    INTEGER NOT NULL,
+            team_id      TEXT NOT NULL,
+            first_name   TEXT NOT NULL,
+            last_name    TEXT NOT NULL,
+            position     TEXT NOT NULL DEFAULT '',
+            jersey_number TEXT,
+            pts          REAL NOT NULL DEFAULT 0,
+            reb          REAL NOT NULL DEFAULT 0,
+            ast          REAL NOT NULL DEFAULT 0,
+            stl          REAL NOT NULL DEFAULT 0,
+            blk          REAL NOT NULL DEFAULT 0,
+            fg_pct       REAL NOT NULL DEFAULT 0,
+            fg3_pct      REAL NOT NULL DEFAULT 0,
+            min          TEXT NOT NULL DEFAULT '0',
+            games_played INTEGER NOT NULL DEFAULT 0,
+            season       TEXT NOT NULL,
+            fetched_at   TEXT NOT NULL,
+            PRIMARY KEY (player_id, season)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_nba_players_team ON nba_player_stats(team_id)")
+        .execute(&pool)
+        .await?;
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(match_date)")
         .execute(&pool)
         .await?;
@@ -560,6 +620,113 @@ pub async fn insert_elo_history(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ── NBA Advanced Stats operations ────────────────────────────────────────────
+
+pub async fn upsert_nba_advanced_stats(pool: &SqlitePool, stats: &crate::models::NbaAdvancedStats) -> Result<()> {
+    sqlx::query(
+        r#"INSERT OR REPLACE INTO nba_advanced_stats
+           (team_id, off_rating, def_rating, net_rating, pace,
+            efg_pct, opp_efg_pct, tov_pct, opp_tov_pct,
+            oreb_pct, opp_oreb_pct, ft_rate, opp_ft_rate,
+            games_played, wins, season, fetched_at)
+           VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?)"#,
+    )
+    .bind(&stats.team_id)
+    .bind(stats.off_rating)
+    .bind(stats.def_rating)
+    .bind(stats.net_rating)
+    .bind(stats.pace)
+    .bind(stats.efg_pct)
+    .bind(stats.opp_efg_pct)
+    .bind(stats.tov_pct)
+    .bind(stats.opp_tov_pct)
+    .bind(stats.oreb_pct)
+    .bind(stats.opp_oreb_pct)
+    .bind(stats.ft_rate)
+    .bind(stats.opp_ft_rate)
+    .bind(stats.games_played)
+    .bind(stats.wins)
+    .bind(&stats.season)
+    .bind(&stats.fetched_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_nba_advanced_stats(
+    pool: &SqlitePool,
+    team_id: &str,
+) -> Result<Option<crate::models::NbaAdvancedStats>> {
+    sqlx::query_as::<_, crate::models::NbaAdvancedStats>(
+        "SELECT * FROM nba_advanced_stats WHERE team_id = ?",
+    )
+    .bind(team_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn get_all_nba_advanced_stats(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::models::NbaAdvancedStats>> {
+    sqlx::query_as::<_, crate::models::NbaAdvancedStats>(
+        "SELECT * FROM nba_advanced_stats ORDER BY net_rating DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn upsert_nba_player_stats(
+    pool: &SqlitePool,
+    p: &crate::models::NbaPlayerStats,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT OR REPLACE INTO nba_player_stats
+           (player_id, team_id, first_name, last_name, position, jersey_number,
+            pts, reb, ast, stl, blk, fg_pct, fg3_pct, min,
+            games_played, season, fetched_at)
+           VALUES (?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?)"#,
+    )
+    .bind(p.player_id)
+    .bind(&p.team_id)
+    .bind(&p.first_name)
+    .bind(&p.last_name)
+    .bind(&p.position)
+    .bind(&p.jersey_number)
+    .bind(p.pts)
+    .bind(p.reb)
+    .bind(p.ast)
+    .bind(p.stl)
+    .bind(p.blk)
+    .bind(p.fg_pct)
+    .bind(p.fg3_pct)
+    .bind(&p.min)
+    .bind(p.games_played)
+    .bind(&p.season)
+    .bind(&p.fetched_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_players_by_team(
+    pool: &SqlitePool,
+    team_id: &str,
+    season: &str,
+) -> Result<Vec<crate::models::NbaPlayerStats>> {
+    sqlx::query_as::<_, crate::models::NbaPlayerStats>(
+        r#"SELECT * FROM nba_player_stats
+           WHERE team_id = ? AND season = ?
+           ORDER BY pts DESC"#,
+    )
+    .bind(team_id)
+    .bind(season)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn get_elo_history(pool: &SqlitePool, team_id: &str) -> Result<Vec<EloHistoryPoint>> {

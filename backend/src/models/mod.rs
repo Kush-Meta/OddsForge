@@ -119,6 +119,118 @@ pub struct EloHistoryPoint {
     pub match_id: Option<String>,
 }
 
+/// Advanced per-team NBA stats fetched from stats.nba.com.
+/// Stores Bayesian-friendly raw values; shrinkage is applied at prediction time.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct NbaAdvancedStats {
+    pub team_id: String,
+    /// Offensive rating: points scored per 100 possessions
+    pub off_rating: f64,
+    /// Defensive rating: points allowed per 100 possessions
+    pub def_rating: f64,
+    /// Net rating: off_rating − def_rating
+    pub net_rating: f64,
+    /// Pace: possessions per 48 minutes
+    pub pace: f64,
+    // ── Four Factors (offense) ───────────────────────────────────────────────
+    pub efg_pct: f64,      // Effective FG%
+    pub opp_efg_pct: f64,  // Opponent eFG% (defensive proxy)
+    pub tov_pct: f64,      // Turnover rate (lower is better for offense)
+    pub opp_tov_pct: f64,  // Forced turnover rate (higher is better for defense)
+    pub oreb_pct: f64,     // Offensive rebound %
+    pub opp_oreb_pct: f64, // Opponent OREB% (defensive proxy)
+    pub ft_rate: f64,      // Free throw rate = FTA/FGA
+    pub opp_ft_rate: f64,  // Opponent FTr
+    // ── Meta ─────────────────────────────────────────────────────────────────
+    pub games_played: i32,
+    pub wins: i32,
+    pub season: String,
+    pub fetched_at: String,
+}
+
+/// Per-component breakdown returned by the /matches/:id/analysis endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchAnalysis {
+    pub match_id: String,
+    pub home_team_name: String,
+    pub away_team_name: String,
+    pub sport: String,
+    pub elo: EloComponent,
+    pub form: FormComponent,
+    pub h2h: H2hComponent,
+    pub schedule: ScheduleComponent,
+    pub model_version: String,
+    pub final_home_prob: f64,
+    pub final_away_prob: f64,
+    pub draw_prob: Option<f64>,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EloComponent {
+    pub home_elo: f64,
+    pub away_elo: f64,
+    pub diff: f64,
+    pub home_prob: f64,
+    pub weight: f64,
+    pub narrative: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormComponent {
+    pub home_avg_margin: f64,
+    pub away_avg_margin: f64,
+    pub home_games_used: i64,
+    pub away_games_used: i64,
+    pub home_prob: f64,
+    pub weight: f64,
+    pub narrative: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct H2hComponent {
+    pub home_wins: i64,
+    pub away_wins: i64,
+    pub draws: i64,
+    pub total: i64,
+    pub home_prob: f64,
+    pub weight: f64,
+    pub narrative: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleComponent {
+    pub home_rest_days: i64,
+    pub away_rest_days: i64,
+    pub away_on_back_to_back: bool,
+    pub home_on_back_to_back: bool,
+    pub away_consecutive_road: i64,
+    pub adjustment: f64,
+    pub narrative: String,
+}
+
+/// NBA player with season averages — one row per player per season.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct NbaPlayerStats {
+    pub player_id: i64,
+    pub team_id: String,        // our internal ID: "nba_<bdl_id>"
+    pub first_name: String,
+    pub last_name: String,
+    pub position: String,
+    pub jersey_number: Option<String>,
+    pub pts: f64,
+    pub reb: f64,
+    pub ast: f64,
+    pub stl: f64,
+    pub blk: f64,
+    pub fg_pct: f64,
+    pub fg3_pct: f64,
+    pub min: String,            // avg minutes, e.g. "28.4"
+    pub games_played: i32,
+    pub season: String,
+    pub fetched_at: String,
+}
+
 // API Response types
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T> {

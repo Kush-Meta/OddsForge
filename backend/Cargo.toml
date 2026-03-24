@@ -47,3 +47,6 @@ thiserror = "1.0"
 # CSV export
 csv = "1.1"
 rand = "0.10.0"
+
+# Fuzzy string matching (team name lookup across APIs)
+strsim = "0.11"
