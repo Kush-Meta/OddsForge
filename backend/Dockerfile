@@ -9,9 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Fetch dependencies first so this layer is cached between source changes
+# Fetch dependencies first so this layer is cached between source changes.
+# A stub src/main.rs is required because cargo needs at least one target to
+# parse the manifest — it gets replaced by the real source in the next step.
 COPY Cargo.toml Cargo.lock ./
-RUN cargo fetch
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs && cargo fetch && rm -rf src
 
 # Build the actual source
 COPY src ./src
