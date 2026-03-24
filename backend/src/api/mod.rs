@@ -15,10 +15,12 @@ use crate::db::{
     clear_all_data, create_pool, get_all_teams, get_elo_history, get_finished_matches_ordered,
     get_team_by_id, get_team_current_stats, get_team_recent_matches, get_teams_by_league,
     get_upcoming_matches, get_prediction_by_match_id, init_database_with_pool, insert_elo_history,
-    get_players_by_team, seed_data,
+    get_players_by_team, save_backtest_result, save_model_params, seed_data,
 };
-use crate::models::{ApiResponse, DatasetRequest, EloComponent, FormComponent, H2hComponent, MatchAnalysis, NbaPlayerStats, ScheduleComponent, UpcomingMatchWithPrediction, TeamProfile, Team};
+use crate::ml::backtest::train_and_evaluate;
+use crate::models::{ApiResponse, DatasetRequest, EloComponent, FeatureContribution, FormComponent, H2hComponent, MatchAnalysis, MlEvaluation, NbaPlayerStats, ScoreDistribution, ScheduleComponent, UpcomingMatchWithPrediction, TeamProfile, Team};
 use crate::services::{DataFetcher, EloCalculator, NbaPlayersFetcher, NbaStatsFetcher, PredictionEngine, refresh_odds_if_stale};
+use crate::services::nba_predictor::{load_ml_model, set_ml_model};
 
 pub async fn serve(port: u16) -> anyhow::Result<()> {
     let pool = create_pool().await?;
@@ -74,6 +76,13 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
                 }
                 Err(e) => tracing::warn!("Could not build NbaPlayersFetcher: {}", e),
             }
+        }
+
+        // Load ML model from DB if available
+        match load_ml_model(&init_pool).await {
+            Ok(true)  => tracing::info!("ML prediction model loaded from DB"),
+            Ok(false) => tracing::info!("No trained ML model found — using rule-based fallback"),
+            Err(e)    => tracing::warn!("ML model load failed: {}", e),
         }
 
         // Always regenerate predictions on startup so model changes take effect immediately
@@ -374,6 +383,11 @@ fn create_router() -> Router<SqlitePool> {
         .route("/predictions/generate", post(generate_predictions_handler))
         .route("/matches/{id}/analysis", get(get_match_analysis_handler))
         .route("/teams/{id}/players", get(get_team_players_handler))
+        // ML endpoints
+        .route("/models/train", post(trigger_train_handler))
+        .route("/models/evaluate", get(get_model_evaluations_handler))
+        .route("/matches/{id}/explain", get(explain_prediction_handler))
+        .route("/predictions/{id}/distribution", get(get_score_distribution_handler))
         // Serve generated export files (CSV / JSON) from the exports directory
         .nest_service("/downloads", ServeDir::new("../data/exports"))
         .layer(
@@ -980,5 +994,171 @@ async fn generate_custom_dataset(
         format: request.format,
         rows: rows.len(),
         generated_at: chrono::Utc::now(),
+    })
+}
+
+// ── ML endpoints ──────────────────────────────────────────────────────────────
+
+/// POST /models/train — Trigger full ML retrain pipeline
+async fn trigger_train_handler(
+    State(pool): State<SqlitePool>,
+) -> Json<ApiResponse<String>> {
+    // Run training in background to avoid blocking the HTTP response
+    let pool_clone = pool.clone();
+    tokio::spawn(async move {
+        match train_and_evaluate(&pool_clone).await {
+            Ok((state, folds)) => {
+                match serde_json::to_string(&state) {
+                    Ok(json) => {
+                        let avg_b = if folds.is_empty() { None }
+                            else { Some(folds.iter().map(|f| f.brier_score).sum::<f64>() / folds.len() as f64) };
+                        let avg_l = if folds.is_empty() { None }
+                            else { Some(folds.iter().map(|f| f.log_loss).sum::<f64>() / folds.len() as f64) };
+                        if let Ok(v) = save_model_params(&pool_clone, "meta", &json, avg_b, avg_l).await {
+                            for f in &folds {
+                                let _ = save_backtest_result(&pool_clone, "meta", f.fold, f.brier_score, f.log_loss, f.accuracy, f.n_games).await;
+                            }
+                            set_ml_model(state).await;
+                            tracing::info!("ML training complete — saved as version {}", v);
+                        }
+                    }
+                    Err(e) => tracing::error!("Failed to serialise ML model: {}", e),
+                }
+            }
+            Err(e) => tracing::error!("ML training failed: {}", e),
+        }
+    });
+
+    Json(ApiResponse::success("Training started in background. Check /models/evaluate for results.".to_string()))
+}
+
+/// GET /models/evaluate — Return latest backtest results
+async fn get_model_evaluations_handler(
+    State(pool): State<SqlitePool>,
+) -> Json<ApiResponse<Vec<MlEvaluation>>> {
+    let rows = sqlx::query(
+        "SELECT model_name, fold, brier_score, log_loss, accuracy, n_games, evaluated_at FROM backtest_results ORDER BY model_name, fold"
+    ).fetch_all(&pool).await;
+
+    match rows {
+        Ok(rows) => {
+            let evals: Vec<MlEvaluation> = rows.iter().map(|r| MlEvaluation {
+                model_name: r.get("model_name"),
+                fold: r.get("fold"),
+                year: 0,
+                n_games: r.get("n_games"),
+                brier_score: r.get("brier_score"),
+                log_loss: r.get("log_loss"),
+                accuracy: r.get("accuracy"),
+                evaluated_at: r.get("evaluated_at"),
+            }).collect();
+            Json(ApiResponse::success(evals))
+        }
+        Err(e) => Json(ApiResponse::error(e.to_string())),
+    }
+}
+
+/// GET /matches/:id/explain — Feature importance for a prediction
+async fn explain_prediction_handler(
+    Path(match_id): Path<String>,
+    State(pool): State<SqlitePool>,
+) -> Json<ApiResponse<Vec<FeatureContribution>>> {
+    use crate::ml::MlPredictor;
+
+    // Look up the match
+    let match_row = sqlx::query(
+        "SELECT id, home_team_id, away_team_id, home_team_name, away_team_name, sport, league, match_date, status, home_score, away_score, created_at, updated_at FROM matches WHERE id = ?"
+    ).bind(&match_id).fetch_optional(&pool).await;
+
+    let m = match match_row {
+        Ok(Some(r)) => match parse_match_row(&r) {
+            Ok(m) => m,
+            Err(e) => return Json(ApiResponse::error(e.to_string())),
+        },
+        Ok(None) => return Json(ApiResponse::error("Match not found".to_string())),
+        Err(e) => return Json(ApiResponse::error(e.to_string())),
+    };
+
+    let mut predictor = MlPredictor::new();
+    let _ = predictor.load_from_db(&pool).await;
+    if !predictor.has_model() {
+        return Json(ApiResponse::error("No trained ML model available. Run POST /models/train first.".to_string()));
+    }
+
+    match predictor.feature_importance(&pool, &m).await {
+        Some(importances) => {
+            let contribs: Vec<FeatureContribution> = importances.iter().map(|(name, val, contrib)| {
+                FeatureContribution { feature_name: name.clone(), feature_value: *val, contribution: *contrib }
+            }).collect();
+            Json(ApiResponse::success(contribs))
+        }
+        None => Json(ApiResponse::error("Could not compute feature importance".to_string())),
+    }
+}
+
+/// GET /predictions/:id/distribution — Monte Carlo score distribution
+async fn get_score_distribution_handler(
+    Path(pred_id): Path<String>,
+    State(pool): State<SqlitePool>,
+) -> Json<ApiResponse<ScoreDistribution>> {
+    use crate::ml::MlPredictor;
+
+    // Get match_id from prediction
+    let pred_row = sqlx::query("SELECT match_id FROM predictions WHERE id = ?")
+        .bind(&pred_id).fetch_optional(&pool).await;
+
+    let match_id = match pred_row {
+        Ok(Some(r)) => r.get::<String, _>("match_id"),
+        Ok(None) => return Json(ApiResponse::error("Prediction not found".to_string())),
+        Err(e) => return Json(ApiResponse::error(e.to_string())),
+    };
+
+    let match_row = sqlx::query(
+        "SELECT id, home_team_id, away_team_id, home_team_name, away_team_name, sport, league, match_date, status, home_score, away_score, created_at, updated_at FROM matches WHERE id = ?"
+    ).bind(&match_id).fetch_optional(&pool).await;
+
+    let m = match match_row {
+        Ok(Some(r)) => match parse_match_row(&r) {
+            Ok(m) => m,
+            Err(e) => return Json(ApiResponse::error(e.to_string())),
+        },
+        Ok(None) => return Json(ApiResponse::error("Match not found".to_string())),
+        Err(e) => return Json(ApiResponse::error(e.to_string())),
+    };
+
+    let mut predictor = MlPredictor::new();
+    let _ = predictor.load_from_db(&pool).await;
+
+    match predictor.score_distribution(&pool, &m).await {
+        Some(buckets) => {
+            let p_home = buckets[40..].iter().sum::<f64>();
+            let expected: f64 = buckets.iter().enumerate()
+                .map(|(i, &p)| p * (i as f64 - 40.0)).sum();
+            Json(ApiResponse::success(ScoreDistribution {
+                match_id,
+                p_home_win: p_home,
+                expected_margin: expected,
+                buckets,
+            }))
+        }
+        None => Json(ApiResponse::error("No trained ML model available".to_string())),
+    }
+}
+
+fn parse_match_row(r: &sqlx::sqlite::SqliteRow) -> anyhow::Result<crate::models::Match> {
+    Ok(crate::models::Match {
+        id: r.get("id"),
+        home_team_id: r.get("home_team_id"),
+        away_team_id: r.get("away_team_id"),
+        home_team_name: r.get("home_team_name"),
+        away_team_name: r.get("away_team_name"),
+        sport: r.get("sport"),
+        league: r.get("league"),
+        match_date: chrono::DateTime::parse_from_rfc3339(&r.get::<String, _>("match_date"))?.with_timezone(&chrono::Utc),
+        status: r.get("status"),
+        home_score: r.get("home_score"),
+        away_score: r.get("away_score"),
+        created_at: chrono::DateTime::parse_from_rfc3339(&r.get::<String, _>("created_at"))?.with_timezone(&chrono::Utc),
+        updated_at: chrono::DateTime::parse_from_rfc3339(&r.get::<String, _>("updated_at"))?.with_timezone(&chrono::Utc),
     })
 }

@@ -24,10 +24,37 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 use crate::db::get_nba_advanced_stats;
+use crate::ml::meta_learner::{MlModelState, MlPredictor};
 use crate::models::{Match, NbaAdvancedStats, Prediction};
+
+// ── Global ML state (tokio RwLock so guards are Send across awaits) ───────────
+
+static ML_LOCK: OnceLock<tokio::sync::RwLock<MlPredictor>> = OnceLock::new();
+
+fn ml_lock() -> &'static tokio::sync::RwLock<MlPredictor> {
+    ML_LOCK.get_or_init(|| tokio::sync::RwLock::new(MlPredictor::new()))
+}
+
+/// Load the latest ML model from DB into the global predictor.
+pub async fn load_ml_model(pool: &SqlitePool) -> Result<bool> {
+    let mut tmp = MlPredictor::new();
+    let loaded = tmp.load_from_db(pool).await?;
+    if loaded {
+        let mut guard = ml_lock().write().await;
+        *guard = tmp;
+    }
+    Ok(loaded)
+}
+
+/// Replace the global ML model with a freshly trained state (async).
+pub async fn set_ml_model(state: MlModelState) {
+    let mut guard = ml_lock().write().await;
+    guard.set_state(state);
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -123,6 +150,27 @@ impl NbaPredictor {
         let model_probs = [net_rating_prob, elo_prob, form_prob, ff_prob, h2h_prob];
         let confidence = self.compute_confidence(&model_probs, final_home, has_advanced);
 
+        // ── Try ML predictor first ────────────────────────────────────────────
+        {
+            let guard = ml_lock().read().await;
+            if let Some(ml_prob) = guard.predict(pool, match_data).await {
+                let ml_away = 1.0 - ml_prob;
+                // Confidence: blend inter-model agreement with ML output strength
+                let ml_conf = 0.5 + (ml_prob - 0.5).abs();
+                return Ok(Prediction {
+                    id: Uuid::new_v4().to_string(),
+                    match_id: match_data.id.clone(),
+                    home_win_probability: ml_prob,
+                    away_win_probability: ml_away,
+                    draw_probability: None,
+                    model_version: guard.model_version(),
+                    confidence_score: ml_conf,
+                    created_at: Utc::now(),
+                });
+            }
+        }
+
+        // ── Fallback: rule-based ensemble ─────────────────────────────────────
         let model_version = if has_advanced {
             "nba_v3.0"
         } else {

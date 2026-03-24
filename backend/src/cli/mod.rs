@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::Row;
 
-use crate::db::{create_pool, get_upcoming_matches};
+use crate::db::{create_pool, get_upcoming_matches, init_database_with_pool, save_model_params, save_backtest_result};
 use crate::services::{DataFetcher, PredictionEngine};
 
 pub async fn fetch_data(sport: &str) -> Result<()> {
@@ -316,5 +316,58 @@ pub async fn show_edges() -> Result<()> {
     println!("⚠️  Note: Market odds are simulated for demonstration purposes.");
     println!("💡 In production, these would be fetched from betting APIs.");
 
+    Ok(())
+}
+
+// ── ML commands ───────────────────────────────────────────────────────────────
+
+pub async fn ingest_kaggle(path: &str) -> Result<()> {
+    let pool = create_pool().await?;
+    init_database_with_pool(&pool).await?;
+    let n = crate::ml::kaggle_ingest::ingest_kaggle_games(&pool, path).await?;
+    println!("Ingested {} games from Kaggle data at {}", n, path);
+    println!("Run 'oddsforge train' to fit ML models on the new data.");
+    Ok(())
+}
+
+pub async fn train_models() -> Result<()> {
+    let pool = create_pool().await?;
+    init_database_with_pool(&pool).await?;
+
+    println!("Training ML models on historical NBA data...");
+    println!("This may take a few minutes for large datasets.");
+
+    let (state, folds) = crate::ml::backtest::train_and_evaluate(&pool).await?;
+
+    let json = serde_json::to_string(&state)?;
+    let avg_brier = if folds.is_empty() { None }
+        else { Some(folds.iter().map(|f| f.brier_score).sum::<f64>() / folds.len() as f64) };
+    let avg_ll = if folds.is_empty() { None }
+        else { Some(folds.iter().map(|f| f.log_loss).sum::<f64>() / folds.len() as f64) };
+
+    let version = save_model_params(&pool, "meta", &json, avg_brier, avg_ll).await?;
+
+    for fold in &folds {
+        save_backtest_result(&pool, "meta", fold.fold, fold.brier_score, fold.log_loss, fold.accuracy, fold.n_games).await?;
+    }
+
+    println!("\nModel trained and saved as version {}", version);
+    println!("Model: {}", state.model_version);
+
+    if folds.is_empty() {
+        println!("Note: not enough data for walk-forward backtest (need 3+ seasons).");
+    } else {
+        println!("\nWalk-forward backtest results:");
+        println!("{:<6} {:<6} {:<8} {:<10} {:<10} {:<8}", "Fold", "Year", "N Games", "Brier", "Log-Loss", "Accuracy");
+        for f in &folds {
+            println!("{:<6} {:<6} {:<8} {:<10.4} {:<10.4} {:<8.1}%",
+                f.fold, f.year, f.n_games, f.brier_score, f.log_loss, f.accuracy * 100.0);
+        }
+        if let (Some(b), Some(l)) = (avg_brier, avg_ll) {
+            println!("\nAverage — Brier: {:.4}  Log-Loss: {:.4}", b, l);
+        }
+    }
+
+    println!("\nRestart the server to load the new model, or POST /models/train via the API.");
     Ok(())
 }

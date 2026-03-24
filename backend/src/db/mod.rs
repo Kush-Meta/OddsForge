@@ -1,5 +1,5 @@
 pub mod seed;
-pub use seed::seed_data;
+pub use seed::seed_database as seed_data;
 
 pub async fn clear_all_data(pool: &SqlitePool) -> Result<()> {
     sqlx::query("DELETE FROM predictions").execute(pool).await?;
@@ -254,7 +254,87 @@ pub async fn init_database_with_pool(pool: &SqlitePool) -> Result<()> {
         .execute(&pool)
         .await?;
 
+    // ── ML tables ──────────────────────────────────────────────────────────────
+
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS ml_features (
+            match_id     TEXT PRIMARY KEY,
+            features_json TEXT NOT NULL,
+            computed_at  TEXT NOT NULL,
+            FOREIGN KEY (match_id) REFERENCES matches (id)
+        )"#,
+    ).execute(&pool).await?;
+
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS model_params (
+            model_name   TEXT NOT NULL,
+            version      INTEGER NOT NULL,
+            params_json  TEXT NOT NULL,
+            trained_at   TEXT NOT NULL,
+            brier_score  REAL,
+            log_loss     REAL,
+            PRIMARY KEY (model_name, version)
+        )"#,
+    ).execute(&pool).await?;
+
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS backtest_results (
+            id           TEXT PRIMARY KEY,
+            model_name   TEXT NOT NULL,
+            fold         INTEGER NOT NULL,
+            brier_score  REAL NOT NULL,
+            log_loss     REAL NOT NULL,
+            accuracy     REAL NOT NULL,
+            n_games      INTEGER NOT NULL,
+            evaluated_at TEXT NOT NULL
+        )"#,
+    ).execute(&pool).await?;
+
     tracing::info!("Database initialized successfully");
+    Ok(())
+}
+
+// ── ML model persistence ──────────────────────────────────────────────────────
+
+pub async fn save_model_params(
+    pool: &SqlitePool,
+    model_name: &str,
+    params_json: &str,
+    brier: Option<f64>,
+    logloss: Option<f64>,
+) -> Result<i32> {
+    let now = Utc::now().to_rfc3339();
+    let version: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM model_params WHERE model_name = ?"
+    ).bind(model_name).fetch_one(pool).await?;
+
+    sqlx::query(
+        "INSERT INTO model_params (model_name, version, params_json, trained_at, brier_score, log_loss) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(model_name).bind(version).bind(params_json)
+    .bind(&now).bind(brier).bind(logloss)
+    .execute(pool).await?;
+
+    Ok(version)
+}
+
+pub async fn save_backtest_result(
+    pool: &SqlitePool,
+    model_name: &str,
+    fold: i32,
+    brier: f64,
+    logloss: f64,
+    accuracy: f64,
+    n_games: i32,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO backtest_results (id, model_name, fold, brier_score, log_loss, accuracy, n_games, evaluated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&id).bind(model_name).bind(fold)
+    .bind(brier).bind(logloss).bind(accuracy).bind(n_games).bind(&now)
+    .execute(pool).await?;
     Ok(())
 }
 

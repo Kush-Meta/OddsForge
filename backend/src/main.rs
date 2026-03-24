@@ -1,6 +1,7 @@
 mod api;
 mod cli;
 mod db;
+mod ml;
 mod models;
 mod services;
 mod utils;
@@ -37,6 +38,14 @@ enum Commands {
     },
     /// Initialize the database
     InitDb,
+    /// Ingest Kaggle NBA CSV data
+    Ingest {
+        /// Path to directory containing games.csv (and optionally teams.csv)
+        #[arg(long, default_value = "data/kaggle")]
+        path: String,
+    },
+    /// Train ML prediction models on all historical data
+    Train,
 }
 
 #[tokio::main]
@@ -69,6 +78,14 @@ async fn main() -> Result<()> {
         Some(Commands::InitDb) => {
             tracing::info!("Initializing database...");
             db::init_database().await?;
+        }
+        Some(Commands::Ingest { path }) => {
+            tracing::info!("Ingesting Kaggle data from: {}", path);
+            cli::ingest_kaggle(&path).await?;
+        }
+        Some(Commands::Train) => {
+            tracing::info!("Training ML prediction models...");
+            cli::train_models().await?;
         }
         None => {
             // Default to serving

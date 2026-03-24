@@ -259,3 +259,33 @@ impl<T> ApiResponse<T> {
         }
     }
 }
+
+// ── ML model types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MlEvaluation {
+    pub model_name: String,
+    pub fold: i32,
+    pub year: i32,
+    pub n_games: i32,
+    pub brier_score: f64,
+    pub log_loss: f64,
+    pub accuracy: f64,
+    pub evaluated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureContribution {
+    pub feature_name: String,
+    pub feature_value: f64,
+    pub contribution: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreDistribution {
+    pub match_id: String,
+    pub p_home_win: f64,
+    pub expected_margin: f64,
+    /// 80 probability buckets: index i → margin = i-40
+    pub buckets: Vec<f64>,
+}
