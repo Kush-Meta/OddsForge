@@ -229,4 +229,67 @@ export interface MatchAnalysis {
   confidence: number;
 }
 
+// ── ML Analytics ─────────────────────────────────────────────────────────────
+export interface MlEvaluation {
+  model_name: string;
+  fold: number;
+  year: number;
+  n_games: number;
+  brier_score: number;
+  log_loss: number;
+  accuracy: number;
+  evaluated_at: string;
+}
+
+export interface FeatureContribution {
+  feature_name: string;
+  feature_value: number;
+  contribution: number;
+}
+
+export interface ScoreDistribution {
+  match_id: string;
+  p_home_win: number;
+  expected_margin: number;
+  buckets: number[]; // 80 buckets, index i → margin = i - 40
+}
+
+export interface HistoryGame {
+  match_id: string;
+  home_team: string;
+  away_team: string;
+  match_date: string;
+  home_score: number;
+  away_score: number;
+  home_won: boolean;
+  season: number;
+}
+
+export const mlApi = {
+  async getEvaluations(): Promise<MlEvaluation[]> {
+    const response = await api.get<ApiResponse<MlEvaluation[]>>('/models/evaluate');
+    return response.data.data || [];
+  },
+
+  async getFeatureImportance(matchId: string): Promise<FeatureContribution[]> {
+    const response = await api.get<ApiResponse<FeatureContribution[]>>(`/matches/${matchId}/explain`);
+    return response.data.data || [];
+  },
+
+  async getScoreDistribution(predictionId: string): Promise<ScoreDistribution | null> {
+    const response = await api.get<ApiResponse<ScoreDistribution>>(`/predictions/${predictionId}/distribution`);
+    return response.data.data || null;
+  },
+
+  async getMatchHistory(limit = 100, offset = 0): Promise<HistoryGame[]> {
+    const response = await api.get<ApiResponse<HistoryGame[]>>(`/matches/history?sport=basketball&limit=${limit}&offset=${offset}`);
+    return response.data.data || [];
+  },
+
+  async triggerTrain(): Promise<string> {
+    const response = await api.post<ApiResponse<string>>('/models/train');
+    return response.data.data || 'Training started';
+  },
+};
+
 export default apiService;

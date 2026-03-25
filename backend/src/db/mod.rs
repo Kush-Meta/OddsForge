@@ -290,6 +290,29 @@ pub async fn init_database_with_pool(pool: &SqlitePool) -> Result<()> {
         )"#,
     ).execute(&pool).await?;
 
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS game_box_stats (
+            id       TEXT PRIMARY KEY,
+            team_id  TEXT NOT NULL,
+            game_date TEXT NOT NULL,
+            pts      REAL NOT NULL DEFAULT 0,
+            fgm      REAL NOT NULL DEFAULT 0,
+            fga      REAL NOT NULL DEFAULT 0,
+            fg3m     REAL NOT NULL DEFAULT 0,
+            fg3a     REAL NOT NULL DEFAULT 0,
+            ftm      REAL NOT NULL DEFAULT 0,
+            fta      REAL NOT NULL DEFAULT 0,
+            oreb     REAL NOT NULL DEFAULT 0,
+            dreb     REAL NOT NULL DEFAULT 0,
+            tov      REAL NOT NULL DEFAULT 0,
+            FOREIGN KEY (team_id) REFERENCES teams(id)
+        )"#,
+    ).execute(&pool).await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_gbs_team_date ON game_box_stats(team_id, game_date)"
+    ).execute(&pool).await?;
+
     tracing::info!("Database initialized successfully");
     Ok(())
 }

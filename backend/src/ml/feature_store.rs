@@ -7,83 +7,164 @@ pub const N_FEATURES: usize = 26;
 
 pub struct Features(pub [f64; N_FEATURES]);
 
+/// Rolling Four Factors computed from the last `n` games in game_box_stats before `before_date`.
+struct RollingFactors {
+    efg_pct: f64,  // (FGM + 0.5*FG3M) / FGA
+    tov_pct: f64,  // TOV / (FGA + 0.44*FTA + TOV)
+    oreb_pg: f64,  // offensive rebounds per game
+    oreb_pct: f64, // OREB / (OREB + opp DREB)  — approximated as OREB / (OREB + DREB) same game
+    ftr: f64,      // FTA / FGA
+    pace: f64,     // possessions per game ≈ FGA - OREB + TOV + 0.44*FTA
+    pts_pg: f64,   // points per game
+}
+
+impl Default for RollingFactors {
+    fn default() -> Self {
+        Self { efg_pct: 0.52, tov_pct: 0.14, oreb_pg: 10.5, oreb_pct: 0.28, ftr: 0.24, pace: 100.0, pts_pg: 110.0 }
+    }
+}
+
+async fn rolling_factors(pool: &SqlitePool, team_id: &str, before_date: &str, n: i64) -> RollingFactors {
+    let rows = sqlx::query(
+        "SELECT pts, fgm, fga, fg3m, fg3a, ftm, fta, oreb, dreb, tov
+         FROM game_box_stats
+         WHERE team_id = ? AND game_date < ?
+         ORDER BY game_date DESC LIMIT ?"
+    )
+    .bind(team_id).bind(before_date).bind(n)
+    .fetch_all(pool).await.unwrap_or_default();
+
+    if rows.is_empty() {
+        return RollingFactors::default();
+    }
+
+    let ng = rows.len() as f64;
+    let (mut pts, mut fgm, mut fga, mut fg3m, mut ftm, mut fta, mut oreb, mut dreb, mut tov) =
+        (0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+
+    for r in &rows {
+        pts  += r.get::<f64, _>("pts");
+        fgm  += r.get::<f64, _>("fgm");
+        fga  += r.get::<f64, _>("fga");
+        fg3m += r.get::<f64, _>("fg3m");
+        ftm  += r.get::<f64, _>("ftm");
+        fta  += r.get::<f64, _>("fta");
+        oreb += r.get::<f64, _>("oreb");
+        dreb += r.get::<f64, _>("dreb");
+        tov  += r.get::<f64, _>("tov");
+    }
+
+    let efg_pct = if fga > 0.0 { (fgm + 0.5 * fg3m) / fga } else { 0.52 };
+    let tov_denom = fga + 0.44 * fta + tov;
+    let tov_pct = if tov_denom > 0.0 { tov / tov_denom } else { 0.14 };
+    let ftr = if fga > 0.0 { fta / fga } else { 0.24 };
+    // OREB% = OREB / (OREB + opp_DREB). Approximate with own DREB as proxy for opp OREB (team rebounds ~= opp misses)
+    let oreb_pct = if (oreb + dreb) > 0.0 { oreb / (oreb + dreb) } else { 0.28 };
+    let oreb_pg = oreb / ng;
+    let pace = (fga - oreb / ng + tov / ng + 0.44 * fta / ng).max(70.0).min(130.0);
+    let pts_pg = pts / ng;
+
+    RollingFactors { efg_pct, tov_pct, oreb_pg, oreb_pct, ftr, pace, pts_pg }
+}
+
+/// Look up a team's ELO at game time from elo_history, falling back to current ELO.
+async fn historical_elo(pool: &SqlitePool, team_id: &str, before_date: &str) -> f64 {
+    // Try elo_history first — gives ELO at the time of the game
+    if let Ok(Some(row)) = sqlx::query(
+        "SELECT elo_rating FROM elo_history WHERE team_id = ? AND date <= ? ORDER BY date DESC LIMIT 1"
+    )
+    .bind(team_id).bind(before_date)
+    .fetch_optional(pool).await
+    {
+        return row.get::<f64, _>("elo_rating");
+    }
+    // Fallback: current ELO
+    sqlx::query("SELECT elo_rating FROM teams WHERE id = ?")
+        .bind(team_id)
+        .fetch_optional(pool).await
+        .ok().flatten()
+        .map(|r| r.get::<f64, _>("elo_rating"))
+        .unwrap_or(1200.0)
+}
+
 pub async fn build_features(pool: &SqlitePool, m: &Match) -> Result<Features> {
     let mut f = [0.0f64; N_FEATURES];
 
-    // ELO ratings
-    let home_elo: f64 = sqlx::query("SELECT elo_rating FROM teams WHERE id = ?")
-        .bind(&m.home_team_id)
-        .fetch_optional(pool).await?
-        .map(|r| r.get::<f64, _>("elo_rating"))
-        .unwrap_or(1200.0);
-    let away_elo: f64 = sqlx::query("SELECT elo_rating FROM teams WHERE id = ?")
-        .bind(&m.away_team_id)
-        .fetch_optional(pool).await?
-        .map(|r| r.get::<f64, _>("elo_rating"))
-        .unwrap_or(1200.0);
+    // Date string for "before this game" queries
+    let before_date = m.match_date.format("%Y-%m-%d").to_string();
 
+    // ── f[0]: ELO differential (historical at game time) ─────────────────────
+    let (home_elo, away_elo) = tokio::join!(
+        historical_elo(pool, &m.home_team_id, &before_date),
+        historical_elo(pool, &m.away_team_id, &before_date),
+    );
     f[0] = home_elo - away_elo;
 
-    // Advanced stats
-    let home_adv = sqlx::query("SELECT net_rating, off_rating, def_rating, efg_pct, tov_pct, oreb_pct, ft_rate, pace FROM nba_advanced_stats WHERE team_id = ?")
-        .bind(&m.home_team_id).fetch_optional(pool).await?;
-    let away_adv = sqlx::query("SELECT net_rating, off_rating, def_rating, efg_pct, tov_pct, oreb_pct, ft_rate, pace FROM nba_advanced_stats WHERE team_id = ?")
-        .bind(&m.away_team_id).fetch_optional(pool).await?;
+    // ── f[1]–f[16]: Rolling Four Factors (last 10 games before this game) ────
+    // Uses game_box_stats when available (post-ingest); falls back to nba_advanced_stats
+    // or league defaults if no box score data exists.
+    let (home_rf, away_rf) = tokio::join!(
+        rolling_factors(pool, &m.home_team_id, &before_date, 10),
+        rolling_factors(pool, &m.away_team_id, &before_date, 10),
+    );
 
-    if let Some(ref r) = home_adv {
-        f[1] = r.get::<f64, _>("net_rating");
-        f[3] = r.get::<f64, _>("off_rating");
-        f[5] = r.get::<f64, _>("def_rating");
-        f[7] = r.get::<f64, _>("efg_pct");
-        f[9] = r.get::<f64, _>("tov_pct");
-        f[11] = r.get::<f64, _>("oreb_pct");
-        f[13] = r.get::<f64, _>("ft_rate");
-        f[15] = r.get::<f64, _>("pace");
-    } else {
-        f[1] = 0.0; f[3] = 110.0; f[5] = 110.0; f[7] = 0.52;
-        f[9] = 0.14; f[11] = 0.28; f[13] = 0.24; f[15] = 100.0;
-    }
-    if let Some(ref r) = away_adv {
-        f[2] = r.get::<f64, _>("net_rating");
-        f[4] = r.get::<f64, _>("off_rating");
-        f[6] = r.get::<f64, _>("def_rating");
-        f[8] = r.get::<f64, _>("efg_pct");
-        f[10] = r.get::<f64, _>("tov_pct");
-        f[12] = r.get::<f64, _>("oreb_pct");
-        f[14] = r.get::<f64, _>("ft_rate");
-        f[16] = r.get::<f64, _>("pace");
-    } else {
-        f[2] = 0.0; f[4] = 110.0; f[6] = 110.0; f[8] = 0.52;
-        f[10] = 0.14; f[12] = 0.28; f[14] = 0.24; f[16] = 100.0;
-    }
+    // Net rating proxy: pts_pg − opp_pts_pg. We store pts_pg; opp is away's pts_pg.
+    // Use the delta as a net rating approximation.
+    let home_net = home_rf.pts_pg - away_rf.pts_pg;
+    let away_net = away_rf.pts_pg - home_rf.pts_pg;
 
-    // Win percentages from team_stats
+    f[1]  = home_net;          // home net rating proxy
+    f[2]  = away_net;          // away net rating proxy
+    f[3]  = home_rf.pts_pg;    // home off rating proxy (pts/game)
+    f[4]  = away_rf.pts_pg;    // away off rating proxy
+    f[5]  = 110.0 - home_rf.pts_pg; // home def rating proxy (crude)
+    f[6]  = 110.0 - away_rf.pts_pg;
+    f[7]  = home_rf.efg_pct;
+    f[8]  = away_rf.efg_pct;
+    f[9]  = home_rf.tov_pct;
+    f[10] = away_rf.tov_pct;
+    f[11] = home_rf.oreb_pct;
+    f[12] = away_rf.oreb_pct;
+    f[13] = home_rf.ftr;
+    f[14] = away_rf.ftr;
+    f[15] = home_rf.pace;
+    f[16] = away_rf.pace;
+
+    // ── f[17]–f[18]: Win% from rolling box stats context ─────────────────────
+    // Count wins in last 20 games before this date
     for (idx, team_id) in [(17usize, &m.home_team_id), (18, &m.away_team_id)] {
-        let row = sqlx::query(
-            "SELECT wins, matches_played FROM team_stats WHERE team_id = ? ORDER BY season DESC LIMIT 1"
-        ).bind(team_id).fetch_optional(pool).await?;
-        if let Some(r) = row {
-            let w: i32 = r.get::<i32, _>("wins");
-            let mp: i32 = r.get::<i32, _>("matches_played");
-            f[idx] = if mp > 0 { w as f64 / mp as f64 } else { 0.5 };
-        } else {
-            f[idx] = 0.5;
-        }
+        let wins: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM matches
+               WHERE status = 'finished' AND match_date < ?
+                 AND home_score IS NOT NULL AND away_score IS NOT NULL
+                 AND (
+                   (home_team_id = ? AND home_score > away_score) OR
+                   (away_team_id = ? AND away_score > home_score)
+                 )
+               ORDER BY match_date DESC LIMIT 20"#
+        ).bind(&before_date).bind(team_id).bind(team_id)
+        .fetch_one(pool).await.unwrap_or(0);
+
+        let played: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM matches WHERE status = 'finished' AND match_date < ? AND (home_team_id = ? OR away_team_id = ?) ORDER BY match_date DESC LIMIT 20"
+        ).bind(&before_date).bind(team_id).bind(team_id)
+        .fetch_one(pool).await.unwrap_or(0);
+
+        f[idx] = if played > 0 { wins as f64 / played as f64 } else { 0.5 };
     }
 
-    // H2H win rate for home team (regressed toward 0.55 with prior weight 3)
-    // We count wins from home_team perspective: home team wins when they score more
-    // regardless of which side they were on historically.
+    // ── f[19]: H2H home team win rate (regressed) ────────────────────────────
     let h2h = sqlx::query(
         r#"SELECT
             SUM(CASE WHEN (home_team_id = ? AND home_score > away_score)
                           OR (away_team_id = ? AND away_score > home_score) THEN 1 ELSE 0 END) as home_wins,
             COUNT(*) as total
            FROM matches
-           WHERE status = 'finished' AND home_score IS NOT NULL
+           WHERE status = 'finished' AND home_score IS NOT NULL AND match_date < ?
              AND ((home_team_id = ? AND away_team_id = ?) OR (home_team_id = ? AND away_team_id = ?))"#
     )
     .bind(&m.home_team_id).bind(&m.home_team_id)
+    .bind(&before_date)
     .bind(&m.home_team_id).bind(&m.away_team_id)
     .bind(&m.away_team_id).bind(&m.home_team_id)
     .fetch_optional(pool).await?;
@@ -96,11 +177,12 @@ pub async fn build_features(pool: &SqlitePool, m: &Match) -> Result<Features> {
         0.55
     };
 
-    // Rest days & back-to-back flags
+    // ── f[20]–f[23]: Rest days & back-to-back ────────────────────────────────
     for (rest_idx, b2b_idx, team_id) in [(20usize, 22usize, &m.home_team_id), (21, 23, &m.away_team_id)] {
         let last = sqlx::query(
-            "SELECT match_date FROM matches WHERE (home_team_id = ? OR away_team_id = ?) AND status = 'finished' ORDER BY match_date DESC LIMIT 1"
-        ).bind(team_id).bind(team_id).fetch_optional(pool).await?;
+            "SELECT match_date FROM matches WHERE (home_team_id = ? OR away_team_id = ?) AND status = 'finished' AND match_date < ? ORDER BY match_date DESC LIMIT 1"
+        ).bind(team_id).bind(team_id).bind(m.match_date.to_rfc3339())
+        .fetch_optional(pool).await?;
 
         let rest = if let Some(r) = last {
             let date_str: String = r.get("match_date");
@@ -113,7 +195,7 @@ pub async fn build_features(pool: &SqlitePool, m: &Match) -> Result<Features> {
         f[b2b_idx] = if rest < 1.5 { 1.0 } else { 0.0 };
     }
 
-    // Opponent-adjusted form (last 10 finished games, avg point diff weighted by opponent ELO)
+    // ── f[24]–f[25]: Opponent-adjusted form (last 10 games, ELO-weighted) ────
     for (form_idx, team_id) in [(24usize, &m.home_team_id), (25, &m.away_team_id)] {
         let rows = sqlx::query(
             r#"SELECT m.home_team_id, m.away_team_id, m.home_score, m.away_score,
@@ -123,14 +205,15 @@ pub async fn build_features(pool: &SqlitePool, m: &Match) -> Result<Features> {
                JOIN teams at ON at.id = m.away_team_id
                WHERE (m.home_team_id = ? OR m.away_team_id = ?)
                  AND m.status = 'finished' AND m.home_score IS NOT NULL
+                 AND m.match_date < ?
                ORDER BY m.match_date DESC LIMIT 10"#
-        ).bind(team_id).bind(team_id).fetch_all(pool).await?;
+        ).bind(team_id).bind(team_id).bind(m.match_date.to_rfc3339())
+        .fetch_all(pool).await?;
 
         if rows.is_empty() {
             f[form_idx] = 0.0;
         } else {
             let mut weighted_sum = 0.0f64;
-            let mut weight_total = 0.0f64;
             let avg_elo = 1200.0f64;
             for r in &rows {
                 let home_id: String = r.get("home_team_id");
@@ -145,9 +228,8 @@ pub async fn build_features(pool: &SqlitePool, m: &Match) -> Result<Features> {
                 };
                 let sos_weight = 1.0 + (opp_elo - avg_elo) / 400.0;
                 weighted_sum += margin * sos_weight.max(0.5).min(2.0);
-                weight_total += 1.0;
             }
-            f[form_idx] = if weight_total > 0.0 { weighted_sum / weight_total } else { 0.0 };
+            f[form_idx] = weighted_sum / rows.len() as f64;
         }
     }
 

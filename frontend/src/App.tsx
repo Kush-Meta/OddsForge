@@ -1,17 +1,19 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { BarChart3, Target, Download, Users, Menu, X } from 'lucide-react';
+import { BarChart3, Target, Download, Users, Menu, X, Brain } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import EdgeFinder from './pages/EdgeFinder';
 import DatasetBuilder from './pages/DatasetBuilder';
 import TeamProfile from './pages/TeamProfile';
 import HowItWorks from './pages/HowItWorks';
+import MLAnalytics from './pages/MLAnalytics';
 import BouncingBall from './components/BouncingBall';
 import './index.css';
 
 const NAV_ITEMS = [
   { path: '/',              icon: BarChart3, label: 'Dashboard'      },
   { path: '/edges',         icon: Target,    label: 'Edge Finder'    },
+  { path: '/ml',            icon: Brain,     label: 'ML Analytics'   },
   { path: '/dataset',       icon: Download,  label: 'Dataset Builder'},
   { path: '/teams',         icon: Users,     label: 'Teams'          },
 ];
@@ -70,6 +72,7 @@ const App: React.FC = () => (
           <Route path="/teams"          element={<TeamProfile />}  />
           <Route path="/teams/:id"      element={<TeamProfile />}  />
           <Route path="/how-it-works"   element={<HowItWorks />}   />
+          <Route path="/ml"             element={<MLAnalytics />}  />
         </Routes>
       </main>
       <BouncingBall />

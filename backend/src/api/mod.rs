@@ -388,6 +388,7 @@ fn create_router() -> Router<SqlitePool> {
         .route("/models/evaluate", get(get_model_evaluations_handler))
         .route("/matches/{id}/explain", get(explain_prediction_handler))
         .route("/predictions/{id}/distribution", get(get_score_distribution_handler))
+        .route("/matches/history", get(get_match_history_handler))
         // Serve generated export files (CSV / JSON) from the exports directory
         .nest_service("/downloads", ServeDir::new("../data/exports"))
         .layer(
@@ -1142,6 +1143,70 @@ async fn get_score_distribution_handler(
             }))
         }
         None => Json(ApiResponse::error("No trained ML model available".to_string())),
+    }
+}
+
+/// GET /matches/history — paginated finished games with scores
+#[derive(Deserialize)]
+struct HistoryQuery {
+    sport: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct HistoryGame {
+    match_id: String,
+    home_team: String,
+    away_team: String,
+    match_date: String,
+    home_score: i32,
+    away_score: i32,
+    home_won: bool,
+    season: i32,
+}
+
+async fn get_match_history_handler(
+    State(pool): State<SqlitePool>,
+    Query(params): Query<HistoryQuery>,
+) -> Json<ApiResponse<Vec<HistoryGame>>> {
+    let sport = params.sport.as_deref().unwrap_or("basketball");
+    let limit = params.limit.unwrap_or(50).min(500);
+    let offset = params.offset.unwrap_or(0);
+
+    let rows = sqlx::query(
+        "SELECT id, home_team_name, away_team_name, match_date, home_score, away_score
+         FROM matches
+         WHERE sport = ? AND status = 'finished'
+           AND home_score IS NOT NULL AND away_score IS NOT NULL
+         ORDER BY match_date DESC LIMIT ? OFFSET ?"
+    )
+    .bind(sport).bind(limit).bind(offset)
+    .fetch_all(&pool).await;
+
+    match rows {
+        Ok(rows) => {
+            let games: Vec<HistoryGame> = rows.iter().filter_map(|r| {
+                let hs: i32 = r.try_get("home_score").ok()?;
+                let aws: i32 = r.try_get("away_score").ok()?;
+                let date_str: String = r.try_get("match_date").ok()?;
+                let season = chrono::DateTime::parse_from_rfc3339(&date_str)
+                    .map(|d| d.format("%Y").to_string().parse::<i32>().unwrap_or(2024))
+                    .unwrap_or(2024);
+                Some(HistoryGame {
+                    match_id: r.try_get("id").ok()?,
+                    home_team: r.try_get("home_team_name").ok()?,
+                    away_team: r.try_get("away_team_name").ok()?,
+                    match_date: date_str,
+                    home_score: hs,
+                    away_score: aws,
+                    home_won: hs > aws,
+                    season,
+                })
+            }).collect();
+            Json(ApiResponse::success(games))
+        }
+        Err(e) => Json(ApiResponse::error(e.to_string())),
     }
 }
 

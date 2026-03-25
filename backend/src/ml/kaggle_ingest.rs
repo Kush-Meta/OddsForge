@@ -38,6 +38,142 @@ struct TeamRow {
     city: String,
 }
 
+/// Ingests games_details.csv → game_box_stats table.
+/// Aggregates all player rows per (GAME_ID, TEAM_ID) into team-level box scores,
+/// then stores one row per team per game with the game date (from games.csv).
+pub async fn ingest_box_stats(pool: &SqlitePool, data_dir: &str) -> Result<usize> {
+    let details_path = format!("{}/games_details.csv", data_dir);
+    let games_path   = format!("{}/games.csv", data_dir);
+    let teams_path   = format!("{}/teams.csv", data_dir);
+
+    if !std::path::Path::new(&details_path).exists() {
+        anyhow::bail!("games_details.csv not found at {}", details_path);
+    }
+
+    // ── Step 1: build kaggle GAME_ID → date ─────────────────────────────────
+    #[derive(Debug, Deserialize)]
+    struct GDateRow {
+        #[serde(rename = "GAME_DATE_EST")]
+        game_date: String,
+        #[serde(rename = "GAME_ID")]
+        game_id: String,
+    }
+    let mut game_dates: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if std::path::Path::new(&games_path).exists() {
+        let mut rdr = Reader::from_path(&games_path)?;
+        for row in rdr.deserialize::<GDateRow>().flatten() {
+            game_dates.insert(row.game_id, row.game_date[..10].to_string());
+        }
+    }
+
+    // ── Step 2: build kaggle TEAM_ID → our team_id (same logic as games ingest) ──
+    let mut kaggle_names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    if std::path::Path::new(&teams_path).exists() {
+        let mut rdr = Reader::from_path(&teams_path)?;
+        for row in rdr.deserialize::<TeamRow>().flatten() {
+            kaggle_names.insert(row.team_id, format!("{} {}", row.city, row.nickname));
+        }
+    }
+    let our_rows = sqlx::query("SELECT id, name FROM teams WHERE sport = 'basketball'")
+        .fetch_all(pool).await?;
+    let our_teams: Vec<(String, String)> = our_rows.iter()
+        .map(|r| (r.get::<String, _>("id"), r.get::<String, _>("name"))).collect();
+
+    let find_team = |kaggle_tid: i64| -> Option<String> {
+        let name = kaggle_names.get(&kaggle_tid).map(|s| s.as_str()).unwrap_or("");
+        if name.is_empty() { return None; }
+        let kn = name.to_lowercase();
+        let kn_nick = kn.split_whitespace().last().unwrap_or("");
+        for (id, our_name) in &our_teams {
+            let on = our_name.to_lowercase();
+            if on.split_whitespace().last().unwrap_or("") == kn_nick { return Some(id.clone()); }
+        }
+        our_teams.iter()
+            .map(|(id, on)| (id, jaro_winkler(name, on)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .filter(|(_, s)| *s >= 0.82)
+            .map(|(id, _)| id.clone())
+    };
+
+    // ── Step 3: aggregate players → team-game box scores ────────────────────
+    #[derive(Debug, Deserialize)]
+    struct DetailRow {
+        #[serde(rename = "GAME_ID")]   game_id: String,
+        #[serde(rename = "TEAM_ID")]   team_id: i64,
+        #[serde(rename = "PTS")]       pts: Option<f64>,
+        #[serde(rename = "FGM")]       fgm: Option<f64>,
+        #[serde(rename = "FGA")]       fga: Option<f64>,
+        #[serde(rename = "FG3M")]      fg3m: Option<f64>,
+        #[serde(rename = "FG3A")]      fg3a: Option<f64>,
+        #[serde(rename = "FTM")]       ftm: Option<f64>,
+        #[serde(rename = "FTA")]       fta: Option<f64>,
+        #[serde(rename = "OREB")]      oreb: Option<f64>,
+        #[serde(rename = "DREB")]      dreb: Option<f64>,
+        #[serde(rename = "TO")]        tov: Option<f64>,
+    }
+
+    // (game_id, kaggle_team_id) → accumulated stats
+    type Key = (String, i64);
+    #[derive(Default)]
+    struct Acc { pts: f64, fgm: f64, fga: f64, fg3m: f64, fg3a: f64, ftm: f64, fta: f64, oreb: f64, dreb: f64, tov: f64 }
+    let mut acc_map: std::collections::HashMap<Key, Acc> = std::collections::HashMap::new();
+
+    let mut rdr = Reader::from_path(&details_path)?;
+    let mut total_rows = 0usize;
+    for row in rdr.deserialize::<DetailRow>().flatten() {
+        let e = acc_map.entry((row.game_id, row.team_id)).or_default();
+        e.pts  += row.pts.unwrap_or(0.0);
+        e.fgm  += row.fgm.unwrap_or(0.0);
+        e.fga  += row.fga.unwrap_or(0.0);
+        e.fg3m += row.fg3m.unwrap_or(0.0);
+        e.fg3a += row.fg3a.unwrap_or(0.0);
+        e.ftm  += row.ftm.unwrap_or(0.0);
+        e.fta  += row.fta.unwrap_or(0.0);
+        e.oreb += row.oreb.unwrap_or(0.0);
+        e.dreb += row.dreb.unwrap_or(0.0);
+        e.tov  += row.tov.unwrap_or(0.0);
+        total_rows += 1;
+    }
+    tracing::info!("Aggregated {} player rows into {} team-game entries", total_rows, acc_map.len());
+
+    // ── Step 4: upsert into game_box_stats ───────────────────────────────────
+    let mut inserted = 0usize;
+    let mut tid_cache: std::collections::HashMap<i64, Option<String>> = std::collections::HashMap::new();
+
+    for ((game_id, kaggle_tid), stats) in &acc_map {
+        let game_date = match game_dates.get(game_id) {
+            Some(d) => d.clone(),
+            None => continue, // no date → skip
+        };
+        let our_tid = tid_cache.entry(*kaggle_tid)
+            .or_insert_with(|| find_team(*kaggle_tid)).clone();
+        let our_tid = match our_tid {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // Deterministic ID: team_id + game_date + game_id
+        let id = format!("gbs_{}_{}", our_tid, game_id);
+
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO game_box_stats
+               (id, team_id, game_date, pts, fgm, fga, fg3m, fg3a, ftm, fta, oreb, dreb, tov)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#
+        )
+        .bind(&id).bind(&our_tid).bind(&game_date)
+        .bind(stats.pts).bind(stats.fgm).bind(stats.fga)
+        .bind(stats.fg3m).bind(stats.fg3a)
+        .bind(stats.ftm).bind(stats.fta)
+        .bind(stats.oreb).bind(stats.dreb).bind(stats.tov)
+        .execute(pool).await?;
+
+        inserted += 1;
+    }
+
+    tracing::info!("game_box_stats: {} rows inserted", inserted);
+    Ok(inserted)
+}
+
 pub async fn ingest_kaggle_games(pool: &SqlitePool, data_dir: &str) -> Result<usize> {
     let games_path = format!("{}/games.csv", data_dir);
     let teams_path = format!("{}/teams.csv", data_dir);

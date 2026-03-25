@@ -8,7 +8,13 @@ frontend/build/
 
 # SQLite databases
 data/*.db
+data/*.db-journal
 data/exports/
+
+# Large Kaggle datasets (download separately — see README)
+data/kaggle/games_details.csv
+data/kaggle/games.csv
+data/kaggle/teams.csv
 
 # Environment variables
 .env

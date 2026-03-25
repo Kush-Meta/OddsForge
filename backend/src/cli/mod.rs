@@ -324,8 +324,16 @@ pub async fn show_edges() -> Result<()> {
 pub async fn ingest_kaggle(path: &str) -> Result<()> {
     let pool = create_pool().await?;
     init_database_with_pool(&pool).await?;
+
     let n = crate::ml::kaggle_ingest::ingest_kaggle_games(&pool, path).await?;
     println!("Ingested {} games from Kaggle data at {}", n, path);
+
+    println!("Ingesting player box scores from games_details.csv...");
+    match crate::ml::kaggle_ingest::ingest_box_stats(&pool, path).await {
+        Ok(nb) => println!("Ingested {} team-game box score rows.", nb),
+        Err(e) => println!("Box stats skipped ({}). games_details.csv may be missing.", e),
+    }
+
     println!("Run 'oddsforge train' to fit ML models on the new data.");
     Ok(())
 }
